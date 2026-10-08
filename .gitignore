@@ -1,0 +1,12 @@
+# Nix
+/result
+/result-*
+/.direnv/
+
+# What `go build ./cmd/...` leaves in the tree
+/jaccard-nfs-nix-store
+
+# Test and editor leftovers
+*.test
+*.out
+.DS_Store
