@@ -37,9 +37,11 @@ spec:
         - name: cache
           mountPath: /cache
       # The app containers start when the store is mounted, not before.
+      # The directory is a mount point from the start, the volume's, so
+      # what is looked for is the NFS mount on it.
       startupProbe:
         exec:
-          command: ["mountpoint", "-q", "/export"]
+          command: ["grep", "-q", " /export nfs4 ", "/proc/mounts"]
         periodSeconds: 1
         failureThreshold: 60
   containers:
@@ -52,7 +54,6 @@ spec:
           mountPath: /nix/store
           # It receives the sidecar's mount and can make none of its own.
           mountPropagation: HostToContainer
-          readOnly: true
   volumes:
     # What the sidecar mounts its server on, and the app sees as the store.
     - name: store

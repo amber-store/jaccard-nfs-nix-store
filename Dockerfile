@@ -16,7 +16,7 @@ LABEL org.opencontainers.image.source=https://github.com/amber-store/jaccard-nfs
 LABEL org.opencontainers.image.description="jaccard-nfs-nix-store: a sidecar that serves jaccard-store references as a directory that fetches what is named"
 LABEL org.opencontainers.image.licenses=LGPL-3.0-only
 # The certificates are for the bucket, which the packs are fetched from
-# over HTTPS. mountpoint, for the pod's startup probe, is BusyBox's.
+# over HTTPS. grep, for the pod's startup probe, is BusyBox's.
 RUN apk add --no-cache ca-certificates
 COPY --from=build /out/jaccard-nfs-nix-store /usr/local/bin/
 # The sidecar mounts, so it runs as root, and in a privileged container.

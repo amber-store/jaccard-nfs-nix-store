@@ -61,10 +61,11 @@ that is killed and restarted leaves the app running.
 ### 2.2 Made in design, for the owner to accept
 
 - The prefix is a **plain string**, as `push-subdirs --prefix` has it: the
-  name `X` in the root is the reference `prefix + X`. The names on the
-  server are `/framework/nix/store<hash>-<name>` and
-  `/laptop/nix/store/<hash>-<name>`, so the prefixes are
-  `/framework/nix/store` and `/laptop/nix/store/`.
+  name `X` in the root is the reference `prefix + X`. A store pushed with
+  the prefix `/framework/nix/store` has references called
+  `/framework/nix/store<hash>-<name>`, and one pushed with
+  `/laptop/nix/store/` has `/laptop/nix/store/<hash>-<name>`: the prefix
+  to serve them with is the one they were pushed with, slash or none.
 - A reference is pulled **whole** into a core packstore. A pack is one zstd
   stream, so nothing smaller than a reference can be fetched.
 - What is materialized is the **contents of regular files**, in a directory
@@ -388,7 +389,7 @@ spec:
     - { name: store, mountPath: /export, mountPropagation: Bidirectional }
     - { name: cache, mountPath: /cache }
     startupProbe:                         # the app starts when the mount is there
-      exec: { command: ["mountpoint", "-q", "/export"] }
+      exec: { command: ["grep", "-q", " /export nfs4 ", "/proc/mounts"] }
       periodSeconds: 1
   containers:
   - name: app
@@ -403,11 +404,14 @@ spec:
 
 - Kubernetes allows `Bidirectional` only to a privileged container;
   `SYS_ADMIN` alone is refused.
+- The probe looks for the NFS mount in the mount table. The brief's
+  `mountpoint -q /export` is true before anything is mounted: the volume
+  makes the directory a mount point.
 - There is no `preStop` hook: the process unmounts on SIGTERM, and a
   sidecar is stopped after the app containers.
 - The node needs the kernel's NFSv4.1 client and a kubelet root that is
   `rshared`.
-- The image is Alpine with the one command, which runs as root; `mountpoint`
+- The image is Alpine with the one command, which runs as root; `grep`
   for the probe is BusyBox's.
 
 ## 11. Layout

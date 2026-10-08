@@ -70,7 +70,7 @@ initContainers:
       - { name: store, mountPath: /export, mountPropagation: Bidirectional }
       - { name: cache, mountPath: /cache }
     startupProbe:                   # the app starts when the store is there
-      exec: { command: ["mountpoint", "-q", "/export"] }
+      exec: { command: ["grep", "-q", " /export nfs4 ", "/proc/mounts"] }
       periodSeconds: 1
 containers:
   - name: app
@@ -91,6 +91,8 @@ volumes:
   propagation to privileged containers only.
 - **Mount it at `/nix/store` in the app.** Symbolic links in a store point
   at `/nix/store/...`, and are followed in the app container.
+- **The probe looks for the NFS mount**, not for a mount point: the
+  directory is one from the start, the volume's.
 - **There is no `preStop` hook.** On SIGTERM the sidecar unmounts while it
   still serves, and a sidecar is stopped after the app containers.
 - **The node** needs the kernel's NFSv4.1 client and a kubelet root that
