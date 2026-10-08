@@ -226,4 +226,4 @@ func Mounted(target string) (fstype string, mounted bool, err error)
 
 ### Task 12: Publish
 
-- [ ] Bring the spec in line with what was built. Create `amber-store/jaccard-nfs-nix-store` public, push `main`, watch CI.
+- [x] Bring the spec in line with what was built. Create `amber-store/jaccard-nfs-nix-store` public, push `main`, watch CI.
