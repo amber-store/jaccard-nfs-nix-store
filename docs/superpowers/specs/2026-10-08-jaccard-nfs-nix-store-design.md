@@ -192,9 +192,11 @@ Everything is read from the objects in the packstore with core's `fstree`.
     lengths in their keys and are worked out once for a file and cached.
     The blobs last read are cached too, 64 MiB of them, because a blob is
     larger than a read.
-- A symbolic link answers with its target as recorded. An absolute target
-  such as `/nix/store/...` resolves in the app container, which is why the
-  mount belongs at `/nix/store` there.
+- A symbolic link answers with its target, in the form Buildbarn gives a
+  path: `./a//b` reads as `a/b`, which names the same file, and a tidy
+  target reads as it was recorded. Its size is the length of what is
+  answered. An absolute target such as `/nix/store/...` resolves in the
+  app container, which is why the mount belongs at `/nix/store` there.
 - Entries of any other type (devices, FIFOs, sockets) are not served: they
   are left out of listings and are `ENOENT` by name. A NAR has none.
 - Extended attributes are not served.
@@ -270,6 +272,10 @@ The inode number is the first eight bytes of the handle.
   endpoint ID through jaccard-store's `node.Dial`, and kept. It is dropped
   after a failed request and dialed again by the next.
 - The client's key is created on first use in the cache directory.
+- A cache is of one server and one prefix, which its file `origin` names
+  from the first start on. A cache that was filled from another server or
+  under another prefix is refused at start: its pins would be answered as
+  names of references they never were.
 - Nothing is ever removed from the cache.
 
 ## 6. Materializing
@@ -320,7 +326,9 @@ the background, while it is already served from the objects.
 - A fetch blocks the request that caused it and no other. Buildbarn has no
   status for "ask again later".
 - The listener is TCP on `--listen`. Access is whoever can reach it, so it
-  listens on loopback.
+  listens on loopback. An accept that fails is tried again, after 5 ms
+  and then twice as long each time up to a second: only the closing of
+  the listener ends the serving.
 
 ## 8. Mount and shutdown
 
@@ -365,7 +373,7 @@ jaccard-nfs-nix-store --server ENDPOINT_ID --prefix PREFIX --cache DIR [--mount 
 | `--materialize-jobs N` | `JACCARD_NFS_MATERIALIZE_JOBS` | `2` |
 
 `urfave/cli/v2`; a flag wins over its variable. The cache directory holds
-`packstore/`, `files/`, `refs`, `handles` and the key. The log is `slog`
+`packstore/`, `files/`, `refs`, `handles`, `origin` and the key. The log is `slog`
 text on standard error: a line for every fetch with its name, what it
 downloaded and how long it took, a line for every reference materialized
 with its files, bytes and time, and a line for every failure.
@@ -473,8 +481,9 @@ Tests are written before the code they cover.
 - `refs`, against a fake of the server: a pull that pins; a second
   `Ensure` that asks nobody; two at once that share a pull; a missing
   reference, and that it is asked for again after 5 s; a failure that is
-  retried and then succeeds; one that outlasts `--pull-timeout`; no more
-  pulls at once than `--pull-jobs`; pins read back after a restart; a pin
+  retried and then succeeds; one that outlasts `--pull-timeout`; an
+  attempt that hangs; no more pulls at once than `--pull-jobs`; a cache
+  opened for another server or prefix; pins read back after a restart; a pin
   only after the objects are synced; a pinned reference handed on to be
   materialized, once.
 - `refs`, end to end in one process: a jaccard-store server with a real
@@ -544,6 +553,7 @@ not have.
   byte-range locks are gone. Nothing in a read-only store takes them.
 - Permissions are `0444` and `0555` whatever was recorded; setuid, setgid
   and sticky bits are not served.
+- The target of a link is not always the text that was recorded (4.2).
 - Buildbarn's packages have no releases and no promise of a stable API,
   bring some ninety modules with them, and do not compile for macOS. The
   read-size wrapper depends on which attributes Buildbarn writes; an

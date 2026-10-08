@@ -123,7 +123,9 @@ jaccard-nfs-nix-store --server ENDPOINT_ID --prefix PREFIX --cache DIR [--mount 
 
 A flag wins over its variable. The cache directory holds the objects
 (`packstore/`), the plain files (`files/`), the pins (`refs`), the handle
-table (`handles`) and the client's key. The key is created on first use;
+table (`handles`), the server and prefix it was filled from (`origin`) and
+the client's key. A cache is of one server and one prefix: started with
+another, the sidecar refuses it. The key is created on first use;
 its endpoint ID is what the server sees the sidecar as.
 
 The log, on standard error, has a line for every reference fetched and for
@@ -160,7 +162,8 @@ authentication, which is why it listens on loopback.
   all, and execute where any execute bit was set. That is what a Nix store
   has. Owners and times are served as recorded.
 - **Only directories, regular files and symbolic links are served**, which
-  is what a NAR has.
+  is what a NAR has. The target of a link reads in the NFS server's form
+  of a path: `./a//b` as `a/b`.
 - **A sidecar killed with its mount in place**, as the pod ends, holds the
   end of the pod up for as long as two request timeouts: six minutes with
   the default options.

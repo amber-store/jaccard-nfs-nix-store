@@ -3,6 +3,8 @@
 //
 // A Store owns the cache directory's packstore and the file refs beside
 // it, a reclog of pins: the names that were fetched and the roots they had.
+// The file origin says which server and prefix the cache is of; it serves
+// no other.
 // Ensure answers a pinned name from memory. Any other name it pulls from
 // the server into the packstore, and it pins the name once the objects are
 // on disk, so that a pin never names objects that are not there. A pin is
@@ -56,6 +58,11 @@ type Options struct {
 	// Prefix is put before a name, as it is, to make the name of the
 	// reference on the server.
 	Prefix string
+	// Server names the server the references come from: its endpoint ID.
+	// It is not dialed with, which is Dial's part, but written to a new
+	// cache beside the prefix: a cache that was filled from another
+	// server or under another prefix is refused by Open.
+	Server string
 	// Dir is the cache directory: the packstore is in packstore/ under it
 	// and the pins are in the file refs. It is created if it is missing.
 	Dir string
@@ -166,6 +173,9 @@ func Open(opts Options) (*Store, error) {
 	}
 
 	if err := os.MkdirAll(opts.Dir, 0o755); err != nil {
+		return nil, fmt.Errorf("refs: %w", err)
+	}
+	if err := claim(opts.Dir, opts.Server, opts.Prefix); err != nil {
 		return nil, fmt.Errorf("refs: %w", err)
 	}
 	// Every write is not synced by itself: the store is synced once after

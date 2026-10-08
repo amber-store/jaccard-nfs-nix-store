@@ -184,6 +184,9 @@ func newWorld(t *testing.T) *world {
 	if err := os.Symlink("bin/run.sh", filepath.Join(hello, "link")); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.Symlink("./bin//run.sh", filepath.Join(hello, "untidy")); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.Mkdir(filepath.Join(hello, "emptydir"), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -564,8 +567,24 @@ func TestInsideAReference(t *testing.T) {
 	if got := target(t, link); got != "bin/run.sh" {
 		t.Errorf("link: target %q", got)
 	}
-	if got := size(t, link); got != uint64(len("bin/run.sh")) {
-		t.Errorf("link: size %d", got)
+	// Buildbarn answers a readlink with the target in a form of its own,
+	// and says the size of that when it is told none. Told the length of
+	// what was recorded, it would say a size the link does not have.
+	_, untidy := w.walk(t, "hello", "untidy")
+	if got := target(t, untidy); got != "bin/run.sh" {
+		t.Errorf("a link to ./bin//run.sh: target %q as Buildbarn gives it", got)
+	}
+	for name, a := range map[string]*virtual.Attributes{"link": link, "untidy": untidy} {
+		if n, ok := a.GetSizeBytes(); ok {
+			t.Errorf("%s: the size is given as %d, and is to be left to the server", name, n)
+		}
+	}
+	// The target is there whenever the attributes are, whatever was asked
+	// for: it is what the size is worked out from.
+	var sizeOnly virtual.Attributes
+	w.leaf(t, "hello", "link").VirtualGetAttributes(ctx, virtual.AttributesMaskSizeBytes, &sizeOnly)
+	if _, ok := sizeOnly.GetSymlinkTarget(); !ok {
+		t.Error("link: asked for its size alone, it has no target to work the size out from")
 	}
 
 	var out virtual.Attributes
@@ -579,15 +598,15 @@ func TestInsideAReference(t *testing.T) {
 	}
 
 	// Only the lookup of the reference itself asked the fetching.
-	if n := w.refs.askedFor("hello"); n != 5 {
-		t.Errorf("the reference was asked for %d times, want once for each of the 5 walks", n)
+	if n := w.refs.askedFor("hello"); n != 7 {
+		t.Errorf("the reference was asked for %d times, want once for each of the 7 walks", n)
 	}
 }
 
 func TestListingADirectoryInPieces(t *testing.T) {
 	w := newWorld(t)
 
-	if got, want := listing(t, w.dir(t, "hello"), 2), []string{"bin", "emptydir", "lib", "link", "many"}; !slices.Equal(got, want) {
+	if got, want := listing(t, w.dir(t, "hello"), 2), []string{"bin", "emptydir", "lib", "link", "many", "untidy"}; !slices.Equal(got, want) {
 		t.Errorf("hello lists %q, want %q", got, want)
 	}
 	if got := listing(t, w.dir(t, "hello", "emptydir"), 5); len(got) != 0 {

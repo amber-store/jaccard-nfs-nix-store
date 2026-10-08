@@ -40,7 +40,6 @@ func attributes(id handles.ID, n tree.Node, requested virtual.AttributesMask, a 
 	a.SetOwnerUserID(n.UID)
 	a.SetOwnerGroupID(n.GID)
 	a.SetLastDataModificationTime(n.Mtime)
-	a.SetSizeBytes(n.Size)
 	permissions := virtual.PermissionsRead
 	if n.Exec || n.Kind == tree.Dir {
 		permissions |= virtual.PermissionsExecute
@@ -49,12 +48,17 @@ func attributes(id handles.ID, n tree.Node, requested virtual.AttributesMask, a 
 	switch n.Kind {
 	case tree.Dir:
 		a.SetFileType(filesystem.FileTypeDirectory)
+		a.SetSizeBytes(0)
 	case tree.Symlink:
 		a.SetFileType(filesystem.FileTypeSymlink)
-		if requested&virtual.AttributesMaskSymlinkTarget != 0 {
-			a.SetSymlinkTarget(path.UNIXFormat.NewParser(n.Target))
-		}
+		// No size, and the target whatever was asked for: Buildbarn
+		// answers a readlink with the target in a form of its own, in
+		// which ./a//b is a/b, and works the size out from that when it
+		// is given none. The length of what was recorded would be the
+		// size of a link the client is never shown.
+		a.SetSymlinkTarget(path.UNIXFormat.NewParser(n.Target))
 	default:
 		a.SetFileType(filesystem.FileTypeRegularFile)
+		a.SetSizeBytes(n.Size)
 	}
 }

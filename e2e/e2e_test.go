@@ -68,6 +68,7 @@ func storePath(t *testing.T, dir string) {
 	}
 	for name, target := range map[string]string{
 		"hello":    "bin/hello",
+		"untidy":   "./bin//hello",
 		"absolute": "/nix/store/somewhere-else/bin/tool",
 		"dangling": "nothing/here",
 	} {
@@ -80,6 +81,11 @@ func storePath(t *testing.T, dir string) {
 		t.Fatal(err)
 	}
 }
+
+// servedAs is how the target of a link reads in the mount when it is not
+// what was recorded: the NFS server answers with a target in a form of
+// its own, which names the same file.
+var servedAs = map[string]string{"./bin//hello": "bin/hello"}
 
 // served reports whether an entry of a source tree is one the mount has.
 func served(e fs.DirEntry) bool {
@@ -154,8 +160,16 @@ func sameTree(t *testing.T, want, got string) {
 			sameTree(t, wp, gp)
 		case wi.Mode()&fs.ModeSymlink != 0:
 			wt, _ := os.Readlink(wp)
-			if gt, err := os.Readlink(gp); err != nil || gt != wt {
+			if as, ok := servedAs[wt]; ok {
+				wt = as
+			}
+			gt, err := os.Readlink(gp)
+			if err != nil || gt != wt {
 				t.Errorf("%s points at %q (%v), want %q", gp, gt, err, wt)
+			}
+			// The size of a link is the length of what a readlink gives.
+			if gi.Size() != int64(len(gt)) {
+				t.Errorf("%s says it is %d bytes, and points at the %d of %q", gp, gi.Size(), len(gt), gt)
 			}
 		default:
 			mode := fs.FileMode(0o444)

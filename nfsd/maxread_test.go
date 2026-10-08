@@ -40,7 +40,7 @@ func opaque(b []byte) []byte {
 
 func join(parts ...[]byte) []byte { return bytes.Join(parts, nil) }
 
-const max = 1 << 20
+const announced = 1 << 20
 
 func TestTheSupportedAttributesNameTheTwo(t *testing.T) {
 	// The list of supported attributes is itself a bitmap of two words.
@@ -48,7 +48,7 @@ func TestTheSupportedAttributesNameTheTwo(t *testing.T) {
 		Attrmask: []uint32{bitSupported | bitType},
 		AttrVals: join(u32(2), u32(bitSupported|bitType|bitLease), u32(bitMode), u32(2)),
 	}
-	announce(&f, []uint32{bitSupported | bitType}, max)
+	announce(&f, []uint32{bitSupported | bitType}, announced)
 
 	want := join(u32(2), u32(bitSupported|bitType|bitLease|bitMaxRead|bitMaxWrite), u32(bitMode), u32(2))
 	if !bytes.Equal(f.AttrVals, want) {
@@ -63,9 +63,9 @@ func TestTheTwoAreGivenWhenAskedFor(t *testing.T) {
 	// What the Linux client asks when it mounts: the limits and the lease.
 	// The program knows only the lease.
 	f := nfsv4_xdr.Fattr4{Attrmask: []uint32{bitLease}, AttrVals: u32(60)}
-	announce(&f, []uint32{bitLease | bitMaxRead | bitMaxWrite}, max)
+	announce(&f, []uint32{bitLease | bitMaxRead | bitMaxWrite}, announced)
 
-	if want := join(u32(60), u64(max), u64(max)); !bytes.Equal(f.AttrVals, want) {
+	if want := join(u32(60), u64(announced), u64(announced)); !bytes.Equal(f.AttrVals, want) {
 		t.Fatalf("values %x, want %x", f.AttrVals, want)
 	}
 	if want := []uint32{bitLease | bitMaxRead | bitMaxWrite}; !slices.Equal(f.Attrmask, want) {
@@ -75,9 +75,9 @@ func TestTheTwoAreGivenWhenAskedFor(t *testing.T) {
 
 func TestOnlyWhatWasAskedForIsGiven(t *testing.T) {
 	f := nfsv4_xdr.Fattr4{Attrmask: []uint32{bitLease}, AttrVals: u32(60)}
-	announce(&f, []uint32{bitLease | bitMaxRead}, max)
+	announce(&f, []uint32{bitLease | bitMaxRead}, announced)
 
-	if want := join(u32(60), u64(max)); !bytes.Equal(f.AttrVals, want) {
+	if want := join(u32(60), u64(announced)); !bytes.Equal(f.AttrVals, want) {
 		t.Fatalf("values %x, want %x", f.AttrVals, want)
 	}
 	if want := []uint32{bitLease | bitMaxRead}; !slices.Equal(f.Attrmask, want) {
@@ -97,9 +97,9 @@ func TestTheTwoGoBetweenTheWords(t *testing.T) {
 		Attrmask: []uint32{bitType | bitFilehandle | bitFileid, bitMode},
 		AttrVals: join(first, second),
 	}
-	announce(&f, []uint32{bitType | bitFilehandle | bitFileid | bitMaxRead | bitMaxWrite, bitMode}, max)
+	announce(&f, []uint32{bitType | bitFilehandle | bitFileid | bitMaxRead | bitMaxWrite, bitMode}, announced)
 
-	if want := join(first, u64(max), u64(max), second); !bytes.Equal(f.AttrVals, want) {
+	if want := join(first, u64(announced), u64(announced), second); !bytes.Equal(f.AttrVals, want) {
 		t.Fatalf("values %x, want %x", f.AttrVals, want)
 	}
 	if want := []uint32{bitType | bitFilehandle | bitFileid | bitMaxRead | bitMaxWrite, bitMode}; !slices.Equal(f.Attrmask, want) {
@@ -109,8 +109,8 @@ func TestTheTwoGoBetweenTheWords(t *testing.T) {
 
 func TestAnAnswerWithNoAttributesAtAll(t *testing.T) {
 	f := nfsv4_xdr.Fattr4{}
-	announce(&f, []uint32{bitMaxRead}, max)
-	if want := u64(max); !bytes.Equal(f.AttrVals, want) {
+	announce(&f, []uint32{bitMaxRead}, announced)
+	if want := u64(announced); !bytes.Equal(f.AttrVals, want) {
 		t.Fatalf("values %x, want %x", f.AttrVals, want)
 	}
 	if want := []uint32{bitMaxRead}; !slices.Equal(f.Attrmask, want) {
@@ -137,7 +137,7 @@ func TestAnAnswerIsLeftAlone(t *testing.T) {
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			f := nfsv4_xdr.Fattr4{Attrmask: slices.Clone(c.mask), AttrVals: slices.Clone(c.vals)}
-			announce(&f, c.request, max)
+			announce(&f, c.request, announced)
 			if !bytes.Equal(f.AttrVals, c.vals) || !slices.Equal(f.Attrmask, c.mask) {
 				t.Fatalf("mask %x values %x, were %x and %x", f.Attrmask, f.AttrVals, c.mask, c.vals)
 			}
@@ -187,11 +187,11 @@ func TestEveryGetattrOfACompoundIsSeenTo(t *testing.T) {
 		refused,
 	}}}
 
-	res, err := (&maxReadProgram{inner: inner, max: max}).NfsV4Nfsproc4Compound(context.Background(), args)
+	res, err := (&maxReadProgram{inner: inner, max: announced}).NfsV4Nfsproc4Compound(context.Background(), args)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got, want := valsOf(t, res.Resarray[1]), join(u32(60), u64(max), u64(max)); !bytes.Equal(got, want) {
+	if got, want := valsOf(t, res.Resarray[1]), join(u32(60), u64(announced), u64(announced)); !bytes.Equal(got, want) {
 		t.Errorf("the getattr that asked: values %x, want %x", got, want)
 	}
 	if got, want := valsOf(t, res.Resarray[2]), u32(60); !bytes.Equal(got, want) {
@@ -204,7 +204,7 @@ func TestEveryGetattrOfACompoundIsSeenTo(t *testing.T) {
 
 func TestWhatTheProgramFailsWithIsPassedOn(t *testing.T) {
 	failure := errors.New("the program failed")
-	wrapped := &maxReadProgram{inner: program{err: failure}, max: max}
+	wrapped := &maxReadProgram{inner: program{err: failure}, max: announced}
 	if _, err := wrapped.NfsV4Nfsproc4Compound(context.Background(), &nfsv4_xdr.Compound4args{}); err != failure {
 		t.Errorf("compound: %v", err)
 	}

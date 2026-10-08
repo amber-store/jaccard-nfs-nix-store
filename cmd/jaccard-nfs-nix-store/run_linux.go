@@ -33,6 +33,7 @@ func run(ctx context.Context, s settings) error {
 
 	sc, err := sidecar.Start(sidecar.Config{
 		Prefix: s.prefix,
+		Server: s.server,
 		Cache:  s.cache,
 		Dial: func(ctx context.Context) (refs.Conn, error) {
 			return refs.Connect(ctx, node.DialConfig{Key: sk, Server: id, Log: log})

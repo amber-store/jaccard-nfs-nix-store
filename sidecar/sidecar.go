@@ -28,6 +28,9 @@ import (
 type Config struct {
 	// Prefix is put before a name in the root to make a reference name.
 	Prefix string
+	// Server names the jaccard-store server, by its endpoint ID. The
+	// cache remembers it: one that was filled from another is refused.
+	Server string
 	// Cache is the directory of everything that is kept: the packstore,
 	// the pins, the materialized files and the handle table.
 	Cache string
@@ -83,6 +86,7 @@ func Start(cfg Config) (_ *Sidecar, err error) {
 	}
 	s.store, err = refs.Open(refs.Options{
 		Prefix:      cfg.Prefix,
+		Server:      cfg.Server,
 		Dir:         cfg.Cache,
 		Dial:        cfg.Dial,
 		PullTimeout: cfg.PullTimeout,

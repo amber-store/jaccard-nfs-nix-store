@@ -27,6 +27,10 @@ const (
 	// The two are what Buildbarn recommends.
 	enforcedLease  = 120 * time.Second
 	announcedLease = 60 * time.Second
+	// An accept that failed is tried again after acceptWait, and after
+	// twice as long each further time, up to acceptWaitMax.
+	acceptWait    = 5 * time.Millisecond
+	acceptWaitMax = time.Second
 )
 
 // Server serves a file system over NFSv4.1 and NFSv4.0.
@@ -108,17 +112,27 @@ func NewServer(fs *FS) *Server {
 }
 
 // Serve accepts connections on l and serves each until it ends. It
-// returns nil when l is closed or the server is, and the error of an
-// accept that fails otherwise.
+// returns when l is closed or the server is.
+//
+// An accept that fails for another reason is tried again, after 5 ms and
+// then twice as long each time up to a second: the process may be out of
+// file descriptors for a moment, or a client gone before it was accepted,
+// and a server that stopped accepting then would leave the mount without
+// one for as long as the process lives.
 func (s *Server) Serve(l net.Listener) error {
+	var wait time.Duration
 	for {
 		c, err := l.Accept()
 		if err != nil {
-			if errors.Is(err, net.ErrClosed) {
+			if errors.Is(err, net.ErrClosed) || s.isClosed() {
 				return nil
 			}
-			return err
+			wait = min(max(2*wait, acceptWait), acceptWaitMax)
+			s.log.Warn("accepting an NFS connection failed, and is tried again", "in", wait, "error", err)
+			time.Sleep(wait)
+			continue
 		}
+		wait = 0
 		if !s.add(c) {
 			c.Close()
 			return nil
@@ -130,6 +144,12 @@ func (s *Server) Serve(l net.Listener) error {
 			}
 		}()
 	}
+}
+
+func (s *Server) isClosed() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.closed
 }
 
 func (s *Server) add(c net.Conn) bool {

@@ -7,6 +7,8 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -48,6 +50,66 @@ func TestServeEndsWhenTheListenerIsClosed(t *testing.T) {
 	if err := srv.Close(); err != nil {
 		t.Fatalf("closing twice: %v", err)
 	}
+}
+
+// flaky is a listener whose first accepts fail, as they do when the
+// process is out of file descriptors for a moment.
+type flaky struct {
+	net.Listener
+	failures atomic.Int32
+	accepts  atomic.Int32
+}
+
+func (f *flaky) Accept() (net.Conn, error) {
+	f.accepts.Add(1)
+	if f.failures.Add(-1) >= 0 {
+		return nil, &net.OpError{Op: "accept", Err: syscall.EMFILE}
+	}
+	return f.Listener.Accept()
+}
+
+func TestAnAcceptThatFailsIsTriedAgain(t *testing.T) {
+	w := newWorld(t)
+	srv := NewServer(w.fs)
+	inner, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	l := &flaky{Listener: inner}
+	l.failures.Store(3)
+	served := make(chan error, 1)
+	go func() { served <- srv.Serve(l) }()
+
+	// A client that connects after the failures is served: the server
+	// did not stop accepting.
+	c, err := net.Dial("tcp", inner.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	deadline := time.Now().Add(10 * time.Second)
+	for l.accepts.Load() < 5 { // three that failed, the client's, and the one that waits
+		select {
+		case err := <-served:
+			t.Fatalf("Serve returned after an accept that failed: %v", err)
+		default:
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%d accepts: the server did not go on after the ones that failed", l.accepts.Load())
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	l.Close()
+	select {
+	case err := <-served:
+		if err != nil {
+			t.Fatalf("Serve: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Serve did not return when its listener was closed")
+	}
+	srv.Close()
 }
 
 func isReset(err error) bool {

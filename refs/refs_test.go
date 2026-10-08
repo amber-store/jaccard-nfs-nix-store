@@ -823,3 +823,86 @@ func TestAnAttemptThatHangsIsEnded(t *testing.T) {
 		t.Fatalf("root %s, want %s", root, src.root)
 	}
 }
+
+// A name keeps the root it was first fetched with, so a cache filled from
+// one server and prefix has nothing to say about another: it is refused,
+// where it would otherwise serve the names of the one as those of the
+// other.
+func TestACacheIsOfOneServerAndPrefix(t *testing.T) {
+	f := newFake()
+	f.refs["store/one"] = newSource(t, map[string]string{"a": "alpha"})
+	dir := filepath.Join(t.TempDir(), "cache")
+	with := func(server, prefix string) Options {
+		o := options(f, dir)
+		o.Server, o.Prefix = server, prefix
+		return o
+	}
+
+	s, err := Open(with("server-a", "store/"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Ensure(context.Background(), "one"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// The same again is the same cache.
+	s, err = Open(with("server-a", "store/"))
+	if err != nil {
+		t.Fatalf("the cache opened again as it was made: %v", err)
+	}
+	if n := s.Count(); n != 1 {
+		t.Fatalf("Count = %d, want the pin that was made", n)
+	}
+	s.Close()
+
+	for what, o := range map[string]Options{
+		"another prefix":           with("server-a", "other/"),
+		"a prefix that is longer":  with("server-a", "store/x"),
+		"no prefix":                with("server-a", ""),
+		"another server":           with("server-b", "store/"),
+		"a server that is unnamed": with("", "store/"),
+	} {
+		s, err := Open(o)
+		if err == nil {
+			s.Close()
+			t.Errorf("%s: the cache was opened", what)
+			continue
+		}
+		// The error says what the cache is of and what was asked for.
+		for _, part := range []string{"server-a", "store/", o.Prefix} {
+			if !strings.Contains(err.Error(), part) {
+				t.Errorf("%s: %q does not name %q", what, err, part)
+			}
+		}
+	}
+
+	// A refusal changed nothing.
+	s, err = Open(with("server-a", "store/"))
+	if err != nil {
+		t.Fatalf("the cache after it was refused to others: %v", err)
+	}
+	s.Close()
+}
+
+// What a prefix or a server is called is written as it is: a prefix with a
+// line feed in it is not another cache's first line.
+func TestTheOriginOfACacheIsNotMistaken(t *testing.T) {
+	f := newFake()
+	dir := filepath.Join(t.TempDir(), "cache")
+	o := options(f, dir)
+	o.Server, o.Prefix = "a", "b\nprefix \"c\""
+	s, err := Open(o)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+	o.Server, o.Prefix = "a\"\nprefix \"b", "c"
+	if s, err := Open(o); err == nil {
+		s.Close()
+		t.Fatal("two servers and prefixes were taken for one")
+	}
+}
