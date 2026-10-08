@@ -13,13 +13,17 @@ fetched the first time it is named. With the prefix under which a machine's
 out of a Nix store it does not hold: what is touched is fetched, the rest
 never is.
 
-It is three things in one process:
+It is four things in one process:
 
 - the **fetching**: a reference is pulled from the jaccard-store server into
   a local [Amber-Store Core](https://github.com/amber-store/core) packstore
   when its name is first looked up;
-- an **NFSv4 server** on the pod's loopback that serves a read-only tree
-  straight from the objects in that packstore;
+- the **materializing**: a fetched reference is written out as plain files,
+  in the background;
+- an **NFSv4 server** on the pod's loopback that serves a read-only tree:
+  names, attributes and links from the objects in the packstore, and the
+  contents of files from the objects until the reference is materialized
+  and from its files after;
 - the **mount** of that server onto a volume the app containers share.
 
 Success: a pod whose app container has an image without the program it
@@ -45,6 +49,10 @@ that is killed and restarted leaves the app running.
   packages `pkg/filesystem/virtual` and `pkg/filesystem/virtual/nfsv4`),
   chosen over go-nfs and over Rust's nfsserve. It speaks NFSv4.0 and 4.1
   and no NFSv3: the mount is NFSv4.1.
+- A reference that is hit is served from the packstore at once and
+  **materialized** on disk at the same time; once it is materialized, its
+  files are served from there. That is more to build, and is for the sake
+  of reads.
 - A sample application is deployed when the sidecar works. Its entry point
   is the owner's to name, and is asked for then.
 
@@ -55,9 +63,16 @@ that is killed and restarted leaves the app running.
   server are `/framework/nix/store<hash>-<name>` and
   `/laptop/nix/store/<hash>-<name>`, so the prefixes are
   `/framework/nix/store` and `/laptop/nix/store/`.
-- A reference is pulled **whole** into a core packstore and served from the
-  objects there. Nothing is extracted to files. A pack is one zstd stream,
-  so nothing smaller than a reference can be fetched.
+- A reference is pulled **whole** into a core packstore. A pack is one zstd
+  stream, so nothing smaller than a reference can be fetched.
+- What is materialized is the **contents of regular files**, in a directory
+  tree of the reference's own shape. Names, types, attributes and link
+  targets are answered from the objects before and after: they are decoded
+  once and held in memory, and the tree on disk then does not have to
+  reproduce owners, modes, times or links.
+- A reference is materialized when its **whole** tree is written and
+  synced: the tree is built under another name and renamed. Files do not
+  change over one by one.
 - Only a lookup of a name **in the root** fetches. Everything under a
   fetched reference is local.
 - A file handle is a **hash of the path**, and the table from handles back
@@ -112,6 +127,8 @@ container.
 - **prefix**: the string put before a name to make a reference name.
 - **name**: one path component in the root of the mount.
 - **pin**: the record that a name was fetched, with the root key it had.
+- **materialized**: of a reference, that the contents of all its regular
+  files are in plain files in the cache.
 - **node**: a directory, regular file or symbolic link in the served tree.
 - **handle**: the 16 bytes by which the NFS client names a node.
 
@@ -142,11 +159,17 @@ Everything is read from the objects in the packstore with core's `fstree`.
 - A directory looks an entry up by name and lists its entries in the order
   they are stored; the index in that order is the cookie. A directory's
   decoded entries are cached, least recently used first out.
-- A regular file is read by offset. Its content key is a blob, or a file
-  node whose leaves are blobs: the offsets of the leaves follow from the
-  lengths in their keys and are worked out once for a file and cached. The
-  blobs last read are cached too, 64 MiB of them, because a blob is larger
-  than a read.
+- A regular file is read by offset, from one of two places that hold the
+  same bytes:
+  - **its file**, once the reference is materialized (section 6): a read
+    at an offset of the plain file. Up to 256 files are kept open, the one
+    read longest ago closed first. A read the file cannot answer, because
+    it is gone or the read fails, is logged and answered from the objects.
+  - **the objects**, until then. The content key is a blob, or a file node
+    whose leaves are blobs: the offsets of the leaves follow from the
+    lengths in their keys and are worked out once for a file and cached.
+    The blobs last read are cached too, 64 MiB of them, because a blob is
+    larger than a read.
 - A symbolic link answers with its target as recorded. An absolute target
   such as `/nix/store/...` resolves in the app container, which is why the
   mount belongs at `/nix/store` there.
@@ -207,6 +230,8 @@ The inode number is the first eight bytes of the handle.
 4. The packstore is synced, and then the pin is appended to the file `refs`
    in the cache directory and that file synced: a pin never names objects
    that are not on disk.
+5. The reference is queued to be materialized (section 6). `Ensure` does
+   not wait for that.
 
 - Lookups of one name at the same moment share one pull. At most
   `--pull-jobs` pulls run at once; the others wait.
@@ -223,7 +248,35 @@ The inode number is the first eight bytes of the handle.
 - The client's key is created on first use in the cache directory.
 - Nothing is ever removed from the cache.
 
-## 6. NFS server
+## 6. Materializing
+
+A pinned reference is written out under `files/` in the cache directory, in
+the background, while it is already served from the objects.
+
+- The tree of the reference is walked and every regular file written with
+  its content, in directories of the same names:
+  `files/done/<name>/<path>`. A reference that is a single file is the file
+  `files/done/<name>`. Nothing else of an entry is reproduced: directories
+  are `0755` and files `0644`, owned by the process, and symbolic links
+  and entries of other types are not written.
+- The tree is built as `files/partial/<name>`. When every file is written,
+  the file system is synced (`syncfs`), the tree renamed to
+  `files/done/<name>` and the directory above synced. The rename is the
+  record: a tree under `done` is whole and on disk. Where there is no
+  `syncfs`, which is where only tests run, each file is synced as it is
+  closed.
+- From then on reads of the reference's files go to that tree (4.2). A
+  file that was being read is read on from there: the bytes are the same.
+- A reference is queued when it is pinned, and at start for every pin that
+  has no tree under `done`. At most `--materialize-jobs` are written at
+  once, in the order they were queued. A name is queued once.
+- At start everything under `files/partial` is removed.
+- A reference that cannot be written, on a full disk or after an I/O
+  error, is logged and its partial tree removed. It goes on being served
+  from the objects and is tried again at the next start, not before.
+- The objects stay in the packstore.
+
+## 7. NFS server
 
 - Buildbarn's NFSv4.1 and NFSv4.0 programs behind its fallback program,
   as Buildbarn itself sets them up: lease times of 120 s enforced and 60 s
@@ -245,7 +298,7 @@ The inode number is the first eight bytes of the handle.
 - The listener is TCP on `--listen`. Access is whoever can reach it, so it
   listens on loopback.
 
-## 7. Mount and shutdown
+## 8. Mount and shutdown
 
 - With `--mount DIR` the process mounts its own server on DIR once it
   accepts connections: `mount(2)`, source `:/`, type `nfs4`, read-only,
@@ -261,13 +314,14 @@ The inode number is the first eight bytes of the handle.
   a plain unmount, tried for 2 s while it is refused as busy, then a
   detaching one, after which the server goes on for 5 s so that the kernel
   can end its session. Then the table is flushed and the process ends. A
-  second signal ends it at once.
+  second signal ends it at once. Materializing stops with the first
+  signal; what it had begun is removed at the next start.
 - `timeo` and `retrans` bound two things: how long a request may take
   before the app sees `EIO` (a fetch of more than three minutes, at the
   default), and how long a pod's end is held up when the sidecar is killed
   with the mount in place (twice that).
 
-## 8. Command
+## 9. Command
 
 ```
 jaccard-nfs-nix-store --server ENDPOINT_ID --prefix PREFIX --cache DIR [--mount DIR]
@@ -284,13 +338,15 @@ jaccard-nfs-nix-store --server ENDPOINT_ID --prefix PREFIX --cache DIR [--mount 
 | `--mount-options OPTS` | `JACCARD_NFS_MOUNT_OPTIONS` | `vers=4.1,soft,timeo=600,retrans=2,lookupcache=positive` |
 | `--pull-timeout D` | `JACCARD_NFS_PULL_TIMEOUT` | `2m` |
 | `--pull-jobs N` | `JACCARD_NFS_PULL_JOBS` | `4` |
+| `--materialize-jobs N` | `JACCARD_NFS_MATERIALIZE_JOBS` | `2` |
 
 `urfave/cli/v2`; a flag wins over its variable. The cache directory holds
-`packstore/`, `refs`, `handles` and the key. The log is `slog` text on
-standard error: a line for every fetch with its name, what it downloaded
-and how long it took, and for every failure.
+`packstore/`, `files/`, `refs`, `handles` and the key. The log is `slog`
+text on standard error: a line for every fetch with its name, what it
+downloaded and how long it took, a line for every reference materialized
+with its files, bytes and time, and a line for every failure.
 
-## 9. Pod
+## 10. Pod
 
 ```yaml
 spec:
@@ -331,23 +387,24 @@ spec:
 - The image is Alpine with the one command, which runs as root; `mountpoint`
   for the probe is BusyBox's.
 
-## 10. Layout
+## 11. Layout
 
 ```
 cmd/jaccard-nfs-nix-store/   the command (Linux)
 refs/      Ensure, the pins, the connection, the retries
 tree/      lookup, listing and reading over core's objects; the caches
+materialize/  a reference written out as files; which are whole; the queue
 handles/   the handle of a path; the table and its file
 nfsd/      Buildbarn's Directory and Leaf over refs, tree and handles;
            the read-size wrapper; the server (Linux)
 mount/     mount, unmount, is-mounted (Linux)
 e2e/       the kernel-mount tests (Linux, root)
-deploy/    the pod of section 9
+deploy/    the pod of section 10
 docs/
 ```
 
-`refs`, `tree` and `handles` import nothing of Buildbarn and build
-everywhere. `nfsd`, `mount`, `e2e` and the command are Linux only, by build
+`refs`, `tree`, `materialize` and `handles` import nothing of Buildbarn
+and build everywhere. `nfsd`, `mount`, `e2e` and the command are Linux only, by build
 tag. `refs` reaches the server through an interface that jaccard-store's
 client satisfies, so its tests need none.
 
@@ -355,7 +412,7 @@ Dependencies: `amber-store/core` and `amber-store/jaccard-store` at the
 versions the server runs with; `bb-remote-execution`, `bb-storage` and
 `go-xdr` pinned by commit, since they have no releases; Go 1.27.
 
-## 11. Testing
+## 12. Testing
 
 Tests are written before the code they cover.
 
@@ -367,50 +424,71 @@ Tests are written before the code they cover.
   from a cookie; reads at the start, across a leaf boundary, at and past
   the end, of an empty file and of a file of one blob, each held against
   the file on disk; a symbolic link; an entry of another type left out.
+- `materialize`, over directories imported as for `tree`: a reference
+  written out is its source file by file, with nested and empty
+  directories, an empty file, a file of several leaves and a name with
+  spaces and a newline in it, and with the link left out; a reference that
+  is one file; nothing under `done` while the writing is held, by a hook,
+  before its last file; a name queued twice is written once; no more at
+  once than `--materialize-jobs`; `partial` emptied at start; pins without
+  a tree queued at start; a write that fails leaves no tree and the
+  reference not materialized; a shutdown in the middle.
 - `refs`, against a fake of the server: a pull that pins; a second
   `Ensure` that asks nobody; two at once that share a pull; a missing
   reference, and that it is asked for again after 5 s; a failure that is
   retried and then succeeds; one that outlasts `--pull-timeout`; no more
   pulls at once than `--pull-jobs`; pins read back after a restart; a pin
-  only after the objects are synced.
+  only after the objects are synced; a pinned reference handed on to be
+  materialized, once.
 - `refs`, end to end in one process: a jaccard-store server with a real
   iroh endpoint on loopback and an in-memory S3, directories pushed with
   jaccard-store's client, a base pack and a patch pack fetched through
   `Ensure`, and the tree held against the directory that was pushed.
 - `nfsd`, through Buildbarn's interfaces: the root's lookup, open by name
   and listing; a directory, a file and a link inside a reference; every
-  mutation refused; handles resolved after the table is read back by a
-  second server; the wrapper over answers with and without the list of
+  mutation refused; a file read before and after its reference is
+  materialized, with the same bytes, and that the second read is the
+  file's (the test alters the file on disk and gets the altered bytes); a
+  materialized file that was removed, read from the objects; handles
+  resolved after the table is read back by a second server; the wrapper over answers with and without the list of
   supported attributes, with a file handle among the values, and with an
   attribute it does not know.
 - `e2e`, with the kernel, as root: the server of the in-process test
   mounted through `mount`; a tree walked and compared with its source,
   modes, links and a 64 MiB file among it; a program run from the mount;
-  a missing name; the read size the kernel settled on; the server stopped
-  and started under the mount with a file open; the unmount of section 7.
+  a missing name; a file read while its reference is held half
+  materialized and again when it is whole; the read size the kernel
+  settled on; the server stopped
+  and started under the mount with a file open; the unmount of section 8.
   They are skipped without root and run in CI under `sudo` and locally in
   a privileged container.
 - By hand before the deployment: the image in a privileged container
   against the real server, a program run out of a fetched store path.
 
 CI runs `gofmt`, `go vet`, the tests and the tests under the race detector
-on Linux. On macOS the three portable packages are what `go test ./...`
+on Linux. On macOS the four portable packages are what `go test ./...`
 covers.
 
-## 12. Out of scope
+## 13. Out of scope
 
-Removing anything from the cache; a reference that changes after it was
-fetched; writing; NFSv3; a DaemonSet or CSI driver that mounts on the host;
+Removing anything from the cache, the blobs of a materialized reference
+among it; answering names, attributes or links from the materialized tree;
+a reference that changes after it was fetched; writing; NFSv3; a DaemonSet or CSI driver that mounts on the host;
 authentication of NFS clients; extended attributes; file types a NAR does
 not have.
 
-## 13. Known limits
+## 14. Known limits
 
 - A fetch that takes longer than the mount's timeout (three minutes by
   default) is `EIO` for the app. The fetch goes on, and the next access
   finds it done.
 - The whole reference is fetched for one file of it, and its parent pack
   too when it is a patch pack.
+- A materialized reference is on disk twice: as objects in the packstore
+  and as files. Files that are the same in two references are written
+  twice.
+- Until a reference is whole on disk, all its reads are served from the
+  objects, also of the files already written.
 - The cache and the handle table only grow.
 - A name that could not be fetched after `--pull-timeout` is `EIO`, not
   `ENOENT`; a name that is missing is `ENOENT` for the next 5 s even if it
