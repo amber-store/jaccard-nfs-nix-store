@@ -162,67 +162,67 @@ func Mounted(target string) (fstype string, mounted bool, err error)
 
 **Files:** `go.mod`, `go.sum`, `LICENSE`, `COPYING`, `.gitignore`, `.dockerignore`, `seed/seed.go`, `seed/seed_linux.go`
 
-- [ ] `go mod init github.com/amber-store/jaccard-nfs-nix-store`, `go 1.27.1`.
-- [ ] `seed/` blank-imports every package the tasks need (core, jaccard-store with its `server`, `bucket/buckettest`, `client`, `node`, `wire`; blake3; cli; x/sys/unix; and, in the Linux file, Buildbarn's `virtual`, `nfsv4`, bb-storage `clock`, `filesystem`, `filesystem/path`, `random`, go-xdr `protocols/nfsv4`, `protocols/rpcv2`, `rpcserver`), so that one `go mod tidy` fills `go.sum` for all of them. Task 11 removes it.
-- [ ] `go build ./...` on macOS and `GOOS=linux go build ./...` both succeed.
-- [ ] `LICENSE` and `COPYING` copied from jaccard-store. Commit.
+- [x] `go mod init github.com/amber-store/jaccard-nfs-nix-store`, `go 1.27.1`.
+- [x] `seed/` blank-imports every package the tasks need (core, jaccard-store with its `server`, `bucket/buckettest`, `client`, `node`, `wire`; blake3; cli; x/sys/unix; and, in the Linux file, Buildbarn's `virtual`, `nfsv4`, bb-storage `clock`, `filesystem`, `filesystem/path`, `random`, go-xdr `protocols/nfsv4`, `protocols/rpcv2`, `rpcserver`), so that one `go mod tidy` fills `go.sum` for all of them. Task 11 removes it.
+- [x] `go build ./...` on macOS and `GOOS=linux go build ./...` both succeed.
+- [x] `LICENSE` and `COPYING` copied from jaccard-store. Commit.
 
 ### Task 2: `reclog`
 
-- [ ] Tests first: records appended and read back in order; an empty and a 70,000-byte record; a name with a newline and bytes that are not UTF-8; a file cut in the middle of the last record loses that record, is cut back to the last whole one, and takes new records after; a flipped byte in the last record does the same; a missing file is created; `Sync` leaves the bytes in the file.
-- [ ] Implement, run, commit.
+- [x] Tests first: records appended and read back in order; an empty and a 70,000-byte record; a name with a newline and bytes that are not UTF-8; a file cut in the middle of the last record loses that record, is cut back to the last whole one, and takes new records after; a flipped byte in the last record does the same; a missing file is created; `Sync` leaves the bytes in the file.
+- [x] Implement, run, commit.
 
 ### Task 3: `handles`
 
-- [ ] Tests first: `Child` is the same in two processes' worth of tables and differs for two names and for two parents; `Root` is zero; `Inode` of a known ID; `Add` twice writes one record; `Path` of a node three deep, of `Root`, of an unknown ID; a table closed and opened again resolves everything added, a name with a newline among it; a record cut short is dropped and the rest kept; 10,000 adds from eight goroutines under `-race`.
-- [ ] Implement, run, commit.
+- [x] Tests first: `Child` is the same in two processes' worth of tables and differs for two names and for two parents; `Root` is zero; `Inode` of a known ID; `Add` twice writes one record; `Path` of a node three deep, of `Root`, of an unknown ID; a table closed and opened again resolves everything added, a name with a newline among it; a record cut short is dropped and the rest kept; 10,000 adds from eight goroutines under `-race`.
+- [x] Implement, run, commit.
 
 ### Task 4: `tree` (parallel)
 
-- [ ] Tests first, over directories written to a temp dir and imported into a temporary packstore with core's `ingest` (as `importDir` in jaccard-store's `cmd/jaccard-store/dir.go` does): `Root` of a directory and of a single file; `Lookup` of a file, a directory, a link, a missing name; attributes (exec bit, mtime, size, uid) against `os.Lstat`; `List` in order, equal to `os.ReadDir`; a directory of 3,000 files listed and each looked up; an empty directory; `ReadAt` at 0, in the middle, across a leaf boundary of a 9 MiB file, at the end (`io.EOF`), past the end, of an empty file, of a one-blob file, each against the file's bytes; a FIFO in the source left out of `List` and `ErrNotFound` by name; the same reads from eight goroutines under `-race`; that a second `ReadAt` of the same blob does not call the getter again.
-- [ ] Implement with three caches (decoded directories, leaf lists by content key, blobs by bytes), run, commit.
+- [x] Tests first, over directories written to a temp dir and imported into a temporary packstore with core's `ingest` (as `importDir` in jaccard-store's `cmd/jaccard-store/dir.go` does): `Root` of a directory and of a single file; `Lookup` of a file, a directory, a link, a missing name; attributes (exec bit, mtime, size, uid) against `os.Lstat`; `List` in order, equal to `os.ReadDir`; a directory of 3,000 files listed and each looked up; an empty directory; `ReadAt` at 0, in the middle, across a leaf boundary of a 9 MiB file, at the end (`io.EOF`), past the end, of an empty file, of a one-blob file, each against the file's bytes; a FIFO in the source left out of `List` and `ErrNotFound` by name; the same reads from eight goroutines under `-race`; that a second `ReadAt` of the same blob does not call the getter again.
+- [x] Implement with three caches (decoded directories, leaf lists by content key, blobs by bytes), run, commit.
 
 ### Task 5: `materialize` (parallel)
 
-- [ ] Tests first, over imported directories as in Task 4: a reference written out equals its source file by file (nested and empty directories, an empty file, a 9 MiB file, a name with spaces and a newline), with a link and a FIFO left out; modes `0755`/`0644`; a single-file reference is the file `done/<name>`; `Done` and `Path` false while the getter is held on the last blob and true after; `Path` joins `rel`; `Queue` twice writes once; with `Jobs: 2` and four references no more than two are in flight; `Open` removes what was under `partial`; a tree already under `done` is `Done` after `Open` without writing; a getter that fails leaves no tree, `Done` false, and a second `Queue` does nothing; `Close` in the middle returns and leaves nothing under `done`; an entry name with a `/` in it (built by hand with `fstree.EncodeDirLeaf`) fails the reference.
-- [ ] Implement: workers, `syncfs` on Linux and per-file sync elsewhere, rename, parent directory synced. Run, commit.
+- [x] Tests first, over imported directories as in Task 4: a reference written out equals its source file by file (nested and empty directories, an empty file, a 9 MiB file, a name with spaces and a newline), with a link and a FIFO left out; modes `0755`/`0644`; a single-file reference is the file `done/<name>`; `Done` and `Path` false while the getter is held on the last blob and true after; `Path` joins `rel`; `Queue` twice writes once; with `Jobs: 2` and four references no more than two are in flight; `Open` removes what was under `partial`; a tree already under `done` is `Done` after `Open` without writing; a getter that fails leaves no tree, `Done` false, and a second `Queue` does nothing; `Close` in the middle returns and leaves nothing under `done`; an entry name with a `/` in it (built by hand with `fstree.EncodeDirLeaf`) fails the reference.
+- [x] Implement: workers, `syncfs` on Linux and per-file sync elsewhere, rename, parent directory synced. Run, commit.
 
 ### Task 6: `refs` and `jstest` (parallel)
 
-- [ ] `refs` tests first, against a fake `Conn` that writes a prepared set of objects into the packstore it is given: a pull pins and returns the root; a second `Ensure` does not call the fake; two at once share one pull; `ErrNotFound` from `client.ErrNotFound`, remembered for `MissingFor` and asked again after; a name with `/`, `.`, `..`, empty, or invalid with the prefix is `ErrNotFound` without a call; a failure retried and then succeeding, with a new `Dial` after the failure; a failure outlasting `PullTimeout` is an error that is not `ErrNotFound`, and the next `Ensure` starts over; twenty names with `PullJobs: 4` never have more than four pulls running; `Ensure` whose context ends returns while the pull goes on and pins; pins survive `Close` and `Open`, in order; `OnPin` once per pin, after `Pinned` is true; `Pins` in order.
-- [ ] `jstest` after jaccard-store's `e2e/e2e_test.go` (`newWorld`, `buckettest.New`), without the clock and the backends.
-- [ ] `refs` end to end (`e2e_test.go`, package `refs_test`): two versions of a directory pushed with `PushDir`, both fetched through `Ensure` with `Connect`, and a tree walk of each root over `Store.Get` equal to the directory; a name that was never pushed is `ErrNotFound`.
-- [ ] Implement, run under `-race`, commit.
+- [x] `refs` tests first, against a fake `Conn` that writes a prepared set of objects into the packstore it is given: a pull pins and returns the root; a second `Ensure` does not call the fake; two at once share one pull; `ErrNotFound` from `client.ErrNotFound`, remembered for `MissingFor` and asked again after; a name with `/`, `.`, `..`, empty, or invalid with the prefix is `ErrNotFound` without a call; a failure retried and then succeeding, with a new `Dial` after the failure; a failure outlasting `PullTimeout` is an error that is not `ErrNotFound`, and the next `Ensure` starts over; twenty names with `PullJobs: 4` never have more than four pulls running; `Ensure` whose context ends returns while the pull goes on and pins; pins survive `Close` and `Open`, in order; `OnPin` once per pin, after `Pinned` is true; `Pins` in order.
+- [x] `jstest` after jaccard-store's `e2e/e2e_test.go` (`newWorld`, `buckettest.New`), without the clock and the backends.
+- [x] `refs` end to end (`e2e_test.go`, package `refs_test`): two versions of a directory pushed with `PushDir`, both fetched through `Ensure` with `Connect`, and a tree walk of each root over `Store.Get` equal to the directory; a name that was never pushed is `ErrNotFound`.
+- [x] Implement, run under `-race`, commit.
 
 ### Task 7: `nfsd`
 
-- [ ] `maxread.go` from the probe, tests first: an answer with the supported-attributes list gains the two bits; values spliced after the first word's values with and without a file handle among them; a request that does not ask is left alone; an unknown attribute in the first word leaves the answer alone.
-- [ ] `fs.go`: `FS` over small interfaces (`Refs`, `Files`), `tree.Reader`, `handles.Table`; the resolver; a cache of resolved nodes and of open files (256).
-- [ ] `root.go`, `dir.go`, `leaf.go`, `attrs.go`: the nodes. Tests through Buildbarn's interfaces with a fake `Refs` over an imported directory: root lookup, open by name, listing by cookie with a reporter that stops after each entry, change ID; directory, file, link; attributes of the table in spec 4.3; mutations refused; read before and after materialization (the file on disk altered, the altered bytes returned); a materialized file removed, read from the objects; resolver over a table read back; an unknown and a short handle.
-- [ ] `server.go`: the two programs, the wrapper, the RPC server, `Serve(listener)`.
-- [ ] Run in a Linux container, commit.
+- [x] `maxread.go` from the probe, tests first: an answer with the supported-attributes list gains the two bits; values spliced after the first word's values with and without a file handle among them; a request that does not ask is left alone; an unknown attribute in the first word leaves the answer alone.
+- [x] `fs.go`: `FS` over small interfaces (`Refs`, `Files`), `tree.Reader`, `handles.Table`; the resolver; a cache of resolved nodes and of open files (256).
+- [x] `root.go`, `dir.go`, `leaf.go`, `attrs.go`: the nodes. Tests through Buildbarn's interfaces with a fake `Refs` over an imported directory: root lookup, open by name, listing by cookie with a reporter that stops after each entry, change ID; directory, file, link; attributes of the table in spec 4.3; mutations refused; read before and after materialization (the file on disk altered, the altered bytes returned); a materialized file removed, read from the objects; resolver over a table read back; an unknown and a short handle.
+- [x] `server.go`: the two programs, the wrapper, the RPC server, `Serve(listener)`.
+- [x] Run in a Linux container, commit.
 
 ### Task 8: `mount`
 
-- [ ] `mountinfo.go` parser with tests over captured `/proc/self/mountinfo` text: the target found with its type, a path with an escaped space, a target that is only a prefix of a mount point, the last of two mounts stacked on one point.
-- [ ] `mount_linux.go`: `Mount` with `MS_RDONLY|MS_NOSUID|MS_NODEV`, `Unmount`, `Detach`, `Mounted`. Commit.
+- [x] `mountinfo.go` parser with tests over captured `/proc/self/mountinfo` text: the target found with its type, a path with an escaped space, a target that is only a prefix of a mount point, the last of two mounts stacked on one point.
+- [x] `mount_linux.go`: `Mount` with `MS_RDONLY|MS_NOSUID|MS_NODEV`, `Unmount`, `Detach`, `Mounted`. Commit.
 
 ### Task 9: The command
 
-- [ ] Flags and variables of spec section 9 with `urfave/cli/v2`; a test of each flag against its variable through a seam that records the settings.
-- [ ] Wiring: `refs.Open` with `OnPin` queueing into `materialize`; every pin without a tree queued at start; `tree`, `handles`, `nfsd`; listen; mount unless mounted already.
-- [ ] Shutdown of spec section 8: first signal cancels materializing, unmounts (2 s of retries on `EBUSY`, then detach and 5 s more of serving), flushes the table, closes; second signal exits. Commit.
+- [x] Flags and variables of spec section 9 with `urfave/cli/v2`; a test of each flag against its variable through a seam that records the settings.
+- [x] Wiring: `refs.Open` with `OnPin` queueing into `materialize`; every pin without a tree queued at start; `tree`, `handles`, `nfsd`; listen; mount unless mounted already.
+- [x] Shutdown of spec section 8: first signal cancels materializing, unmounts (2 s of retries on `EBUSY`, then detach and 5 s more of serving), flushes the table, closes; second signal exits. Commit.
 
 ### Task 10: `e2e`, with the kernel
 
-- [ ] Tests that skip unless root on Linux: `jstest` server, a tree pushed (3,000-file directory, 64 MiB file, executable script, links, empty directory and file), the sidecar's parts started in-process and mounted on a temp dir; the walk compared with the source; the script run; a missing name; a file read while materializing is held and again after; `rsize` in `/proc/mounts` is 1048576; the NFS server stopped and started under the mount with a file open; unmount.
-- [ ] `scripts/test-linux.sh`: the whole suite in a privileged `golang:1.27` container. Run it, commit.
+- [x] Tests that skip unless root on Linux: `jstest` server, a tree pushed (3,000-file directory, 64 MiB file, executable script, links, empty directory and file), the sidecar's parts started in-process and mounted on a temp dir; the walk compared with the source; the script run; a missing name; a file read while materializing is held and again after; `rsize` in `/proc/mounts` is 1048576; the NFS server stopped and started under the mount with a file open; unmount.
+- [x] `scripts/test-linux.sh`: the whole suite in a privileged `golang:1.27` container. Run it, commit.
 
 ### Task 11: Image, CI, README, pod
 
-- [ ] Remove `seed/`, `go mod tidy`.
-- [ ] `Dockerfile` (golang:1.27-alpine to alpine, one command, root), `flake.nix` and `.envrc` after jaccard-store's with Go 1.27, `.github/workflows/test.yml` (gofmt, vet, tests, race, the kernel tests under `sudo`) and `release.yml` (image and release on a tag), `deploy/pod.yaml` of spec section 10, `README.md`.
-- [ ] Build the image, run it privileged against the real server with a prefix of the image's architecture, run a program out of the mount. Commit.
+- [x] Remove `seed/`, `go mod tidy`.
+- [x] `Dockerfile` (golang:1.27-alpine to alpine, one command, root), `flake.nix` and `.envrc` after jaccard-store's with Go 1.27, `.github/workflows/test.yml` (gofmt, vet, tests, race, the kernel tests under `sudo`) and `release.yml` (image and release on a tag), `deploy/pod.yaml` of spec section 10, `README.md`.
+- [x] Build the image, run it privileged against the real server with a prefix of the image's architecture, run a program out of the mount. Commit.
 
 ### Task 12: Publish
 

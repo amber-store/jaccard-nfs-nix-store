@@ -1,0 +1,63 @@
+# A pod whose app container runs a program out of a Nix store it does not
+# hold: the sidecar fetches every store path the program touches from a
+# jaccard-store server, the first time it is touched.
+#
+# What to change: the server's endpoint ID, the prefix the store was pushed
+# under, and the command, which is a path of that store.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: nix-store-example
+spec:
+  initContainers:
+    # An init container that restarts is a sidecar: it is started before
+    # the app containers and stopped after them.
+    - name: nix-store
+      image: ghcr.io/amber-store/jaccard-nfs-nix-store:latest
+      restartPolicy: Always
+      securityContext:
+        # It mounts, and a mount that is to reach the other containers
+        # (Bidirectional) is allowed to privileged containers alone.
+        privileged: true
+      env:
+        - name: JACCARD_SERVER
+          value: "0000000000000000000000000000000000000000000000000000000000000000"
+        # Put before a name as it is: the references here are called
+        # /framework/nix/store<hash>-<name>.
+        - name: JACCARD_PREFIX
+          value: /framework/nix/store
+        - name: JACCARD_NFS_CACHE
+          value: /cache
+        - name: JACCARD_NFS_MOUNT
+          value: /export
+      volumeMounts:
+        - name: store
+          mountPath: /export
+          mountPropagation: Bidirectional
+        - name: cache
+          mountPath: /cache
+      # The app containers start when the store is mounted, not before.
+      startupProbe:
+        exec:
+          command: ["mountpoint", "-q", "/export"]
+        periodSeconds: 1
+        failureThreshold: 60
+  containers:
+    - name: app
+      # Any image: the program and everything it needs come from the store.
+      image: busybox:1.37
+      command: ["/nix/store/00000000000000000000000000000000-hello-2.12.2/bin/hello"]
+      volumeMounts:
+        - name: store
+          mountPath: /nix/store
+          # It receives the sidecar's mount and can make none of its own.
+          mountPropagation: HostToContainer
+          readOnly: true
+  volumes:
+    # What the sidecar mounts its server on, and the app sees as the store.
+    - name: store
+      emptyDir: {}
+    # What was fetched. It lives as long as the pod, across restarts of
+    # the sidecar.
+    - name: cache
+      emptyDir: {}

@@ -1,7 +1,9 @@
 # jaccard-nfs-nix-store: design
 
-Date: 2026-10-08. Status: written for the owner's review. Not implemented;
-section 2.3 records what a throwaway probe measured.
+Date: 2026-10-08. Status: approved by the owner and implemented. Section
+2.3 records what a throwaway probe measured before, section 2.4 what the
+implementation settled; where the code needed something this document did
+not say, the document was brought in line.
 
 ## 1. Purpose
 
@@ -122,6 +124,25 @@ container.
 - The head of `bb-remote-execution` needs Go 1.27.1. The probe was 31 MB,
   stripped.
 
+### 2.4 Made in implementation
+
+- The pins and the handle table are kept in one kind of file (`reclog`):
+  records one after another, each with its length before it and a CRC-32C
+  after. A record that a crash cut short, or that fails its checksum, ends
+  the file there.
+- One attempt at a pull may take an hour. A transfer that hangs is ended
+  then and counts as a failure, so that it does not keep its name from
+  being fetched for ever.
+- Resolved nodes are not kept. A handle is resolved again every time,
+  through the table and the directories the tree has decoded, which costs
+  a few lookups in memory.
+- The parts are put together in a package of their own, `sidecar`, which
+  the command starts and the end-to-end tests start too: what is tested
+  with the kernel is what runs.
+- A process cannot run a program from a mount it serves itself: the
+  thread that starts a program stands still until the program is loaded.
+  The sidecar never does; the tests go through a shell.
+
 ## 3. Terms
 
 - **prefix**: the string put before a name to make a reference name.
@@ -206,15 +227,15 @@ The inode number is the first eight bytes of the handle.
   enters it when it is first given out: by a lookup, an open by name, or a
   listing that reports it.
 - The table is the file `handles` in the cache directory: a record is the
-  parent's handle, the length of the name and the name. It is read whole
-  at start and appended to, through a buffer flushed every second and at
-  shutdown. A record cut short by a crash is dropped. A handle lost that
-  way is `ESTALE`: a lookup of the path gives the same handle again, and a
-  file that was open under it has to be opened again.
+  parent's handle and the name. It is read whole at start and appended to,
+  through a buffer flushed every second and at shutdown. A record cut
+  short by a crash is dropped. A handle lost that way is `ESTALE`: a
+  lookup of the path gives the same handle again, and a file that was open
+  under it has to be opened again.
 - A handle is resolved by following the table to the root, taking the pin
-  of the first name, and looking the remaining names up in the tree. What
-  that finds is cached with the table's entry. A handle that is not in the
-  table, or whose first name has no pin, is `ESTALE`.
+  of the first name, and looking the remaining names up in the tree. A
+  handle that is not in the table, or whose first name has no pin, is
+  `ESTALE`. Nothing is fetched to resolve a handle.
 - The table is held in memory and never shrinks: about 150 bytes for every
   path that was ever looked up or listed.
 
@@ -227,9 +248,9 @@ The inode number is the first eight bytes of the handle.
 3. Otherwise the reference is pulled with jaccard-store's `client.Pull`
    into the packstore: its pack, and the pack's parent if objects are
    still missing after that. Every object is checked against its key.
-4. The packstore is synced, and then the pin is appended to the file `refs`
-   in the cache directory and that file synced: a pin never names objects
-   that are not on disk.
+4. The packstore is synced, and then the pin, the root and the name, is
+   appended to the file `refs` in the cache directory and that file
+   synced: a pin never names objects that are not on disk.
 5. The reference is queued to be materialized (section 6). `Ensure` does
    not wait for that.
 
@@ -242,6 +263,8 @@ The inode number is the first eight bytes of the handle.
   connection, until `--pull-timeout` has passed since the first failure.
   Then everyone waiting gets the error, which is served as `EIO`, and the
   next lookup starts over.
+- An attempt that has neither ended nor failed after an hour is ended and
+  is a failure like any other.
 - The connection to the server is dialed when it is first needed, by
   endpoint ID through jaccard-store's `node.Dial`, and kept. It is dropped
   after a failed request and dialed again by the next.
@@ -390,23 +413,30 @@ spec:
 ## 11. Layout
 
 ```
-cmd/jaccard-nfs-nix-store/   the command (Linux)
+cmd/jaccard-nfs-nix-store/   the command: the flags, and a sidecar until the signal
+sidecar/   the parts put together, the mount, the order of the end (Linux)
 refs/      Ensure, the pins, the connection, the retries
 tree/      lookup, listing and reading over core's objects; the caches
 materialize/  a reference written out as files; which are whole; the queue
 handles/   the handle of a path; the table and its file
+reclog/    the append-only file of records the pins and the table are in
 nfsd/      Buildbarn's Directory and Leaf over refs, tree and handles;
            the read-size wrapper; the server (Linux)
 mount/     mount, unmount, is-mounted (Linux)
+jstest/    a jaccard-store server in one process, for tests
 e2e/       the kernel-mount tests (Linux, root)
+scripts/   test-linux.sh: the tests in a privileged Linux container
 deploy/    the pod of section 10
 docs/
 ```
 
-`refs`, `tree`, `materialize` and `handles` import nothing of Buildbarn
-and build everywhere. `nfsd`, `mount`, `e2e` and the command are Linux only, by build
-tag. `refs` reaches the server through an interface that jaccard-store's
-client satisfies, so its tests need none.
+`refs`, `tree`, `materialize`, `handles` and `reclog` import nothing of
+Buildbarn and build everywhere, and so do the parts of `mount`, `sidecar`
+and the command that touch neither Buildbarn nor `mount(2)`: the reading
+of a mount table, the order of the unmount, the flags. `nfsd`, the rest of
+those three and `e2e` are Linux only, by build tag. `refs` reaches the
+server through an interface that jaccard-store's client satisfies, so its
+tests need none.
 
 Dependencies: `amber-store/core` and `amber-store/jaccard-store` at the
 versions the server runs with; `bb-remote-execution`, `bb-storage` and
@@ -416,6 +446,9 @@ versions the server runs with; `bb-remote-execution`, `bb-storage` and
 
 Tests are written before the code they cover.
 
+- `reclog`: records back in order, an empty and a large one, bytes that
+  are no text; a file cut at every place of its last record, and one with
+  a byte flipped, loses that record, is cut back and takes records again.
 - `handles`: the handle of a path is the same in two tables; two paths
   differ; the table read back from its file resolves what was added; a
   file cut short loses its last record and nothing else; an unknown handle.
@@ -453,21 +486,29 @@ Tests are written before the code they cover.
   resolved after the table is read back by a second server; the wrapper over answers with and without the list of
   supported attributes, with a file handle among the values, and with an
   attribute it does not know.
-- `e2e`, with the kernel, as root: the server of the in-process test
-  mounted through `mount`; a tree walked and compared with its source,
-  modes, links and a 64 MiB file among it; a program run from the mount;
-  a missing name; a file read while its reference is held half
-  materialized and again when it is whole; the read size the kernel
-  settled on; the server stopped
-  and started under the mount with a file open; the unmount of section 8.
-  They are skipped without root and run in CI under `sudo` and locally in
-  a privileged container.
+- `mount`: a mount table read: the mount on top of two on one point, a
+  path with an escaped space, a path a mount point only begins with.
+- `sidecar`: the order of the unmount against a kernel that is busy for a
+  moment, stays busy, has nothing mounted, or fails.
+- The command: every flag against its variable, the flag over the
+  variable, the defaults, and what is refused.
+- `e2e`, with the kernel, as root: a sidecar started on the server of the
+  in-process test and mounted; a program run from a path that was never
+  fetched; a tree walked and compared with its source, a directory of
+  3,000 files, links, modes, times and a 64 MiB file among it; the same
+  again from the files once the reference is materialized, with the
+  kernel's caches dropped; a reference kept as a patch pack; a reference
+  that is one file, opened without a lookup; writes refused; a name that
+  is missing and, once it is pushed, is not; the read size the kernel
+  settled on; the sidecar closed and started again under the mount with a
+  file open; the unmount of section 8. They are skipped without root and
+  run in CI under `sudo` and locally in a privileged container.
 - By hand before the deployment: the image in a privileged container
   against the real server, a program run out of a fetched store path.
 
-CI runs `gofmt`, `go vet`, the tests and the tests under the race detector
-on Linux. On macOS the four portable packages are what `go test ./...`
-covers.
+CI runs `gofmt`, `go vet`, the tests, the tests under the race detector
+and the tests with the kernel, on Linux. On macOS `go test ./...` covers
+what builds there.
 
 ## 13. Out of scope
 

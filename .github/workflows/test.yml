@@ -1,0 +1,30 @@
+name: Test
+
+on: [push, pull_request]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: gofmt
+        run: test -z "$(gofmt -l .)"
+      - run: go vet ./...
+      - name: tests
+        run: go test -timeout 20m ./...
+      - name: tests with the race detector
+        run: go test -race -timeout 20m ./...
+      # The tests in e2e mount the sidecar's server with the kernel's NFS
+      # client, which takes root. They are built as the runner's user, so
+      # that nothing of root's is left in the caches, and run as root.
+      - name: tests with the kernel
+        run: |
+          go test -c -o /tmp/e2e.test ./e2e/
+          sudo /tmp/e2e.test -test.v -test.timeout 20m
