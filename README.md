@@ -104,6 +104,51 @@ volumes:
   sidecar within ten seconds, as when the pod's sandbox and with it the
   network namespace was made anew, the mount is replaced.
 
+## Preloading
+
+The sidecar also listens for HTTP on `127.0.0.1:9889`, which the
+containers of a pod share. A list of store paths sent there is fetched
+ahead of any use:
+
+```sh
+nix-store -qR /nix/store/<hash>-<name> > closure      # where the store is
+curl --fail-with-body --data-binary @closure http://127.0.0.1:9889/v1/preload
+```
+
+- A line is a path under `/nix/store` (a path *into* a store path stands
+  for the store path) or the name of a store path by itself. Empty lines
+  are skipped, and a path named twice is fetched once.
+- The paths are fetched 20 at a time (`--preload-jobs`). These pulls are
+  not counted among `--pull-jobs`, which are the lookups'.
+- The answer is `200` and `fetched N paths` when all of them are in the
+  store: pulled and pinned, as after a lookup. They are materialized in
+  the background, which the answer does not wait for.
+- **The first path that cannot be fetched ends the rest**: nothing more is
+  begun, and the pulls that are running are ended, unless a lookup waits
+  for the same path. The answer is `404` with the path when the server has
+  no such path, and `502` with the path and the reason when it could not
+  be fetched.
+- A line that is no path is `400`, with its number, before anything is
+  fetched.
+
+In a pod, an init container that comes after the sidecar can do this
+before the app starts (a sidecar is started before the init containers
+that follow it):
+
+```yaml
+initContainers:
+  - name: nix-store        # the sidecar, as above
+    ...
+  - name: preload
+    image: busybox:1.37
+    command: ["wget", "-q", "-O-", "--post-file=/closure/paths", "http://127.0.0.1:9889/v1/preload"]
+    volumeMounts:
+      - { name: closure, mountPath: /closure }   # a ConfigMap with the list
+```
+
+There is no authentication, which is why the endpoint listens on loopback.
+`--preload-listen ''` turns it off.
+
 ## Command
 
 ```sh
@@ -122,6 +167,8 @@ jaccard-nfs-nix-store --server ENDPOINT_ID --prefix PREFIX --cache DIR [--mount 
 | `--pull-timeout D` | `JACCARD_NFS_PULL_TIMEOUT` | `2m` |
 | `--pull-jobs N` | `JACCARD_NFS_PULL_JOBS` | `4` |
 | `--materialize-jobs N` | `JACCARD_NFS_MATERIALIZE_JOBS` | `2` |
+| `--preload-listen ADDR` | `JACCARD_NFS_PRELOAD_LISTEN` | `127.0.0.1:9889`; `''` is no endpoint |
+| `--preload-jobs N` | `JACCARD_NFS_PRELOAD_JOBS` | `20` |
 
 A flag wins over its variable. The cache directory holds the objects
 (`packstore/`), the plain files (`files/`), the pins (`refs`), the handle
@@ -207,6 +254,7 @@ scripts/test-linux.sh -run Mounted -v ./e2e/
 | package | what it is |
 | --- | --- |
 | `refs` | fetching: a reference pulled once and pinned |
+| `preload` | the HTTP endpoint that fetches a list of store paths ahead |
 | `materialize` | a pinned reference written out as plain files |
 | `tree` | directories and file content read from the objects |
 | `handles` | the file handle of a path, and the table back from it |

@@ -906,3 +906,304 @@ func TestTheOriginOfACacheIsNotMistaken(t *testing.T) {
 		t.Fatal("two servers and prefixes were taken for one")
 	}
 }
+
+// held returns a fake whose pulls wait until they are let go or their
+// context ends, with the references given.
+func held(t *testing.T, names ...string) (*fake, chan struct{}) {
+	t.Helper()
+	f := newFake()
+	for _, name := range names {
+		f.refs[name] = newSource(t, map[string]string{"file": name})
+	}
+	f.hold = make(chan struct{})
+	return f, f.hold
+}
+
+// eventually waits for a condition that another goroutine brings about.
+func eventually(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatalf("it never came about that %s", what)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func (f *fake) runningNow() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.running
+}
+
+func TestPreloadPullsAndPins(t *testing.T) {
+	f := newFake()
+	src := newSource(t, map[string]string{"a": "alpha"})
+	f.refs["one"] = src
+	pinned := 0
+	s := open(t, f, func(o *Options) { o.OnPin = func(string, key.Key) { pinned++ } })
+
+	root, err := s.Preload(context.Background(), "one")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if root != src.root {
+		t.Fatalf("root %s, want %s", root, src.root)
+	}
+	if got, ok := s.Pinned("one"); !ok || got != src.root || pinned != 1 {
+		t.Fatalf("Pinned = %s, %v; OnPin called %d times", got, ok, pinned)
+	}
+	// What is pinned is answered at once, to a preload as to a lookup.
+	if _, err := s.Preload(context.Background(), "one"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Ensure(context.Background(), "one"); err != nil {
+		t.Fatal(err)
+	}
+	if calls, _ := f.count(); calls != 1 {
+		t.Fatalf("%d pulls, want 1", calls)
+	}
+
+	if _, err := s.Preload(context.Background(), "nothing"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("a reference the server does not have: %v", err)
+	}
+}
+
+// The pulls of a preload do not wait for one of the PullJobs, which are
+// the lookups': whoever preloads says how many of its own run at once.
+func TestPreloadIsNotOneOfThePullJobs(t *testing.T) {
+	names := []string{"a", "b", "c", "d", "e", "f"}
+	f, hold := held(t, append(names, "looked-up-1", "looked-up-2")...)
+	s := open(t, f, func(o *Options) { o.PullJobs = 1 })
+
+	var wg sync.WaitGroup
+	for _, name := range names {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if _, err := s.Preload(context.Background(), name); err != nil {
+				t.Errorf("preload of %q: %v", name, err)
+			}
+		}()
+	}
+	eventually(t, "all six preloads pull at once", func() bool { return f.runningNow() == len(names) })
+
+	// The lookups still have their one job, and only that one.
+	for _, name := range []string{"looked-up-1", "looked-up-2"} {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if _, err := s.Ensure(context.Background(), name); err != nil {
+				t.Errorf("lookup of %q: %v", name, err)
+			}
+		}()
+	}
+	eventually(t, "a lookup pulls beside them", func() bool { return f.runningNow() == len(names)+1 })
+	time.Sleep(50 * time.Millisecond)
+	if n := f.runningNow(); n != len(names)+1 {
+		t.Fatalf("%d pulls at once, want the six preloads and one lookup", n)
+	}
+	close(hold)
+	wg.Wait()
+}
+
+// A preload that is given up ends its pull: nobody else wanted it.
+func TestAPreloadThatIsGivenUpEndsItsPull(t *testing.T) {
+	f, hold := held(t, "one")
+	s := open(t, f, nil)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	got := make(chan error, 1)
+	go func() {
+		_, err := s.Preload(ctx, "one")
+		got <- err
+	}()
+	waitStarted(t, f)
+	cancel()
+	if err := <-got; !errors.Is(err, context.Canceled) {
+		t.Fatalf("the preload that was given up: %v", err)
+	}
+	eventually(t, "the pull ended", func() bool { return f.runningNow() == 0 })
+	if _, ok := s.Pinned("one"); ok {
+		t.Fatal("a reference whose pull was ended is pinned")
+	}
+	// The pull was ended, not the connection it ran over.
+	if f.conns[0].isClosed() {
+		t.Fatal("ending a pull closed the connection")
+	}
+
+	// It is fetched when it is asked for again, over the same connection.
+	close(hold)
+	if _, err := s.Ensure(context.Background(), "one"); err != nil {
+		t.Fatal(err)
+	}
+	if calls, dials := f.count(); calls != 2 || dials != 1 {
+		t.Fatalf("%d pulls and %d dials, want 2 and 1", calls, dials)
+	}
+}
+
+// A lookup that waits for the same reference keeps the pull going, whether
+// it came before the preload or after: it is the kernel that waits.
+func TestALookupKeepsThePullOfAPreloadGoing(t *testing.T) {
+	for _, order := range []string{"the lookup first", "the preload first"} {
+		t.Run(order, func(t *testing.T) {
+			f, hold := held(t, "one")
+			s := open(t, f, nil)
+
+			ctx, cancel := context.WithCancel(context.Background())
+			preloaded, looked := make(chan error, 1), make(chan error, 1)
+			preload := func() {
+				go func() {
+					_, err := s.Preload(ctx, "one")
+					preloaded <- err
+				}()
+			}
+			lookup := func() {
+				go func() {
+					_, err := s.Ensure(context.Background(), "one")
+					looked <- err
+				}()
+			}
+			if order == "the lookup first" {
+				lookup()
+				waitStarted(t, f)
+				preload()
+			} else {
+				preload()
+				waitStarted(t, f)
+				lookup()
+			}
+			// Both wait for the one pull.
+			time.Sleep(50 * time.Millisecond)
+			cancel()
+			if err := <-preloaded; !errors.Is(err, context.Canceled) {
+				t.Fatalf("the preload that was given up: %v", err)
+			}
+			time.Sleep(50 * time.Millisecond)
+			if n := f.runningNow(); n != 1 {
+				t.Fatalf("%d pulls running after the preload was given up, want the one the lookup waits for", n)
+			}
+			close(hold)
+			if err := <-looked; err != nil {
+				t.Fatalf("the lookup: %v", err)
+			}
+			if _, ok := s.Pinned("one"); !ok {
+				t.Fatal("not pinned")
+			}
+			if calls, _ := f.count(); calls != 1 {
+				t.Fatalf("%d pulls, want the one", calls)
+			}
+		})
+	}
+}
+
+// A lookup whose own request ended still counts: the kernel asks again,
+// and is to find the pull running or done.
+func TestALookupThatGaveUpStillKeepsThePull(t *testing.T) {
+	f, hold := held(t, "one")
+	s := open(t, f, nil)
+
+	lookupCtx, giveUp := context.WithCancel(context.Background())
+	looked := make(chan error, 1)
+	go func() {
+		_, err := s.Ensure(lookupCtx, "one")
+		looked <- err
+	}()
+	waitStarted(t, f)
+	giveUp()
+	<-looked
+
+	ctx, cancel := context.WithCancel(context.Background())
+	preloaded := make(chan error, 1)
+	go func() {
+		_, err := s.Preload(ctx, "one")
+		preloaded <- err
+	}()
+	time.Sleep(20 * time.Millisecond)
+	cancel()
+	<-preloaded
+	time.Sleep(50 * time.Millisecond)
+	if n := f.runningNow(); n != 1 {
+		t.Fatalf("%d pulls running, want the one a lookup asked for", n)
+	}
+	close(hold)
+	eventually(t, "the reference is pinned", func() bool { _, ok := s.Pinned("one"); return ok })
+}
+
+// Two preloads of one reference share its pull, which ends when the last
+// of them is given up.
+func TestThePullEndsWithTheLastPreload(t *testing.T) {
+	f, _ := held(t, "one")
+	s := open(t, f, nil)
+
+	firstCtx, giveUpFirst := context.WithCancel(context.Background())
+	secondCtx, giveUpSecond := context.WithCancel(context.Background())
+	first, second := make(chan error, 1), make(chan error, 1)
+	go func() { _, err := s.Preload(firstCtx, "one"); first <- err }()
+	waitStarted(t, f)
+	go func() { _, err := s.Preload(secondCtx, "one"); second <- err }()
+	time.Sleep(50 * time.Millisecond)
+
+	giveUpFirst()
+	<-first
+	time.Sleep(50 * time.Millisecond)
+	if n := f.runningNow(); n != 1 {
+		t.Fatalf("%d pulls running after one of two preloads was given up, want 1", n)
+	}
+	giveUpSecond()
+	<-second
+	eventually(t, "the pull ended", func() bool { return f.runningNow() == 0 })
+	if calls, _ := f.count(); calls != 1 {
+		t.Fatalf("%d pulls, want the one they shared", calls)
+	}
+}
+
+// Whoever asks for a reference just after its pull was ended gets a pull
+// of its own, and not the end of the other.
+func TestAskingRightAfterAPullWasEnded(t *testing.T) {
+	f := newFake()
+	src := newSource(t, map[string]string{"a": "alpha"})
+	f.refs["one"] = src
+	f.delay = 20 * time.Millisecond
+	s := open(t, f, nil)
+
+	for range 30 {
+		ctx, cancel := context.WithCancel(context.Background())
+		go s.Preload(ctx, "one")
+		time.Sleep(time.Millisecond)
+		cancel()
+		if _, ok := s.Pinned("one"); ok {
+			break // the pull was done before it could be ended
+		}
+		root, err := s.Ensure(context.Background(), "one")
+		if err != nil {
+			t.Fatalf("the lookup after a pull that was ended: %v", err)
+		}
+		if root != src.root {
+			t.Fatalf("root %s", root)
+		}
+		break
+	}
+	if n := s.Count(); n != 1 {
+		t.Fatalf("Count = %d, want the one pin", n)
+	}
+}
+
+func TestCloseEndsThePullsOfPreloads(t *testing.T) {
+	f, _ := held(t, "one", "two")
+	s := open(t, f, nil)
+	errs := make(chan error, 2)
+	for _, name := range []string{"one", "two"} {
+		go func() { _, err := s.Preload(context.Background(), name); errs <- err }()
+	}
+	eventually(t, "both pull", func() bool { return f.runningNow() == 2 })
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		if err := <-errs; err == nil || errors.Is(err, ErrNotFound) {
+			t.Fatalf("a preload cut short by Close: %v", err)
+		}
+	}
+}

@@ -11,11 +11,15 @@
 // for good: nothing here asks the server about a name again, and nothing
 // is ever removed.
 //
-// A pull belongs to the store and to no request. Lookups of one name share
-// one pull, a caller that gives up does not end it, and whoever asks next
-// finds it running or done. A pull that fails for any reason but a missing
-// reference is tried again over a new connection until Options.PullTimeout
-// has passed.
+// Whoever asks for one name at the same moment shares one pull. Two kinds
+// ask. A lookup (Ensure) is the kernel's: its pull belongs to the store
+// and to no request, a caller that gives up does not end it, and whoever
+// asks next finds it running or done. A preload (Preload) is somebody's
+// wish to have a name before it is needed: its pull is not one of the
+// PullJobs, and ends when everyone who preloads it has given up, unless a
+// lookup has asked for the name as well. A pull that fails for any reason
+// but a missing reference is tried again over a new connection until
+// Options.PullTimeout has passed.
 package refs
 
 import (
@@ -137,6 +141,26 @@ type fetch struct {
 	done chan struct{}
 	root key.Key
 	err  error
+
+	// ctx is what the pull runs under. It ends when the store is closed
+	// and when the fetch is abandoned.
+	ctx    context.Context
+	cancel context.CancelFunc
+	// jobbed says that the pull takes one of the PullJobs: it was begun
+	// by a lookup. One begun by a preload does not.
+	jobbed bool
+
+	// What follows is guarded by the store's mu.
+
+	// kept says that a lookup has asked for the name: the pull then runs
+	// to its end, whoever gives up.
+	kept bool
+	// preloads counts the preloads that wait for it.
+	preloads int
+	// abandoned says that the last preload gave up with no lookup having
+	// asked: the pull was ended, the fetch has left the table, and what
+	// it brought, if it brought anything after all, is not pinned.
+	abandoned bool
 }
 
 // Open opens the store in opts.Dir, creating what is missing of it, and
@@ -214,13 +238,30 @@ func Open(opts Options) (*Store, error) {
 }
 
 // Ensure returns the root of the reference name, fetching it from the
-// server unless it is pinned. A name the server has no reference under is
-// ErrNotFound, and so is one that could not name a reference; any other
-// failure to fetch is an error that is not.
+// server unless it is pinned. It is what a lookup asks. A name the server
+// has no reference under is ErrNotFound, and so is one that could not name
+// a reference; any other failure to fetch is an error that is not.
 //
 // When ctx ends Ensure returns its error. The pull it waited for goes on,
 // and pins the name if it succeeds.
 func (s *Store) Ensure(ctx context.Context, name string) (key.Key, error) {
+	return s.await(ctx, name, true)
+}
+
+// Preload returns the root of the reference name as Ensure does, for
+// somebody who wants the name fetched before it is looked up.
+//
+// Its pull is not one of the PullJobs: how many names are preloaded at
+// once is the caller's to say. And when ctx ends, the pull ends with it,
+// unless another preload still waits for the name or a lookup has asked
+// for it: nothing is pinned then, and the name is fetched from the start
+// when it is next asked for.
+func (s *Store) Preload(ctx context.Context, name string) (key.Key, error) {
+	return s.await(ctx, name, false)
+}
+
+// await is Ensure for a lookup and Preload otherwise.
+func (s *Store) await(ctx context.Context, name string, lookup bool) (key.Key, error) {
 	s.mu.Lock()
 	if s.closed {
 		s.mu.Unlock()
@@ -243,12 +284,18 @@ func (s *Store) Ensure(ctx context.Context, name string) (key.Key, error) {
 	}
 	f := s.fetches[name]
 	if f == nil {
-		f = &fetch{done: make(chan struct{})}
+		f = &fetch{done: make(chan struct{}), jobbed: lookup}
+		f.ctx, f.cancel = context.WithCancel(s.ctx)
 		s.fetches[name] = f
 		// Under mu, as closed is: Close does not start to wait while a
 		// fetch is being added.
 		s.pulls.Add(1)
 		go s.run(name, f)
+	}
+	if lookup {
+		f.kept = true
+	} else {
+		f.preloads++
 	}
 	s.mu.Unlock()
 
@@ -256,7 +303,31 @@ func (s *Store) Ensure(ctx context.Context, name string) (key.Key, error) {
 	case <-f.done:
 		return f.root, f.err
 	case <-ctx.Done():
+		if !lookup {
+			s.giveUp(name, f)
+		}
 		return key.Key{}, ctx.Err()
+	}
+}
+
+// giveUp takes a preload off the fetch f of name, and ends the pull if it
+// was the last and no lookup has asked for the name.
+func (s *Store) giveUp(name string, f *fetch) {
+	s.mu.Lock()
+	f.preloads--
+	abandon := f.preloads == 0 && !f.kept && !f.abandoned
+	if abandon {
+		f.abandoned = true
+		// Out of the table at once: whoever asks for the name from now
+		// on begins a fetch of their own, and does not get the end of
+		// this one.
+		if s.fetches[name] == f {
+			delete(s.fetches, name)
+		}
+	}
+	s.mu.Unlock()
+	if abandon {
+		f.cancel()
 	}
 }
 
@@ -273,28 +344,43 @@ func (s *Store) nameable(name string) bool {
 // run fetches name and pins it, and answers everyone who waits on f.
 func (s *Store) run(name string, f *fetch) {
 	defer s.pulls.Done()
-	root, err := s.pull(name)
+	defer f.cancel()
+	root, err := s.pull(name, f)
 	pinned := false
 	if err == nil {
 		// Held until the pin is in memory as well, which is below.
 		s.pinMu.Lock()
-		if err = s.writePin(Pin{Name: name, Root: root}); err != nil {
+		s.mu.Lock()
+		abandoned := f.abandoned
+		s.mu.Unlock()
+		switch {
+		case abandoned:
+			// The pull was ended and came through all the same. The
+			// name may be being fetched again by now, by a fetch that
+			// will pin it; this one has nobody to answer.
 			s.pinMu.Unlock()
-			err = fmt.Errorf("refs: pinning %q: %w", name, err)
-			s.log.Error("pinning failed", "name", name, "error", err)
-		} else {
-			pinned = true
+			err = fmt.Errorf("refs: fetching %q: %w", name, context.Canceled)
+		default:
+			if err = s.writePin(Pin{Name: name, Root: root}); err != nil {
+				s.pinMu.Unlock()
+				err = fmt.Errorf("refs: pinning %q: %w", name, err)
+				s.log.Error("pinning failed", "name", name, "error", err)
+			} else {
+				pinned = true
+			}
 		}
 	}
 
 	// The fetch leaves the table in the step in which what it found
 	// arrives: nobody finds neither.
 	s.mu.Lock()
-	delete(s.fetches, name)
+	if s.fetches[name] == f {
+		delete(s.fetches, name)
+	}
 	switch {
 	case pinned:
 		s.pins.add(Pin{Name: name, Root: root})
-	case errors.Is(err, ErrNotFound):
+	case errors.Is(err, ErrNotFound) && !f.abandoned:
 		s.rememberMissing(name)
 	}
 	s.mu.Unlock()
@@ -338,13 +424,14 @@ func (s *Store) writePin(pin Pin) error {
 // pull pulls the reference of name into the packstore and returns its
 // root. A pull that fails is tried again, after RetryWait and then twice
 // as long each time up to RetryMax, until PullTimeout has passed since the
-// first failure. A missing reference is ErrNotFound and is not tried again.
-func (s *Store) pull(name string) (key.Key, error) {
+// first failure. A missing reference is ErrNotFound and is not tried again,
+// and neither is a pull that was ended.
+func (s *Store) pull(name string, f *fetch) (key.Key, error) {
 	began := time.Now()
 	var failedAt time.Time // of the first failure
 	wait := s.opts.RetryWait
 	for attempt := 1; ; attempt++ {
-		res, err := s.attempt(name)
+		res, err := s.attempt(name, f)
 		if err == nil {
 			s.log.Info("fetched", "name", name, "root", res.Root,
 				"packs", res.Packs, "objects", res.Objects, "bytes", res.Bytes,
@@ -354,8 +441,8 @@ func (s *Store) pull(name string) (key.Key, error) {
 		if errors.Is(err, client.ErrNotFound) {
 			return key.Key{}, fmt.Errorf("%w: %q", ErrNotFound, name)
 		}
-		if s.ctx.Err() != nil {
-			return key.Key{}, fmt.Errorf("refs: fetching %q: %w", name, errClosed)
+		if err := s.ended(name, f); err != nil {
+			return key.Key{}, err
 		}
 		now := time.Now()
 		if failedAt.IsZero() {
@@ -373,34 +460,51 @@ func (s *Store) pull(name string) (key.Key, error) {
 		timer := time.NewTimer(wait)
 		select {
 		case <-timer.C:
-		case <-s.ctx.Done():
+		case <-f.ctx.Done():
 			timer.Stop()
-			return key.Key{}, fmt.Errorf("refs: fetching %q: %w", name, errClosed)
+			return key.Key{}, s.ended(name, f)
 		}
 		wait = min(2*wait, s.opts.RetryMax)
 	}
 }
 
-// attempt pulls the reference of name once, when one of the jobs is free.
-// A failure costs the connection it happened on.
-func (s *Store) attempt(name string) (client.PullResult, error) {
-	select {
-	case s.jobs <- struct{}{}:
-	case <-s.ctx.Done():
-		return client.PullResult{}, errClosed
+// ended returns why the pull of f is over when its context has ended, and
+// nil while it has not: the store was closed, or the fetch abandoned.
+func (s *Store) ended(name string, f *fetch) error {
+	switch {
+	case f.ctx.Err() == nil:
+		return nil
+	case s.ctx.Err() != nil:
+		return fmt.Errorf("refs: fetching %q: %w", name, errClosed)
 	}
-	defer func() { <-s.jobs }()
+	s.log.Info("fetch ended: nobody waits for it any more", "name", name)
+	return fmt.Errorf("refs: fetching %q: %w", name, context.Canceled)
+}
+
+// attempt pulls the reference of name once. A pull that a lookup began
+// waits for one of the jobs to be free; one that a preload began does not.
+// A failure costs the connection it happened on, unless the failure is
+// that the pull was ended.
+func (s *Store) attempt(name string, f *fetch) (client.PullResult, error) {
+	if f.jobbed {
+		select {
+		case s.jobs <- struct{}{}:
+		case <-f.ctx.Done():
+			return client.PullResult{}, f.ctx.Err()
+		}
+		defer func() { <-s.jobs }()
+	}
 
 	conn, gen, err := s.connect()
 	if err != nil {
 		return client.PullResult{}, fmt.Errorf("dialing the server: %w", err)
 	}
-	ctx, cancel := context.WithTimeout(s.ctx, s.opts.AttemptTimeout)
+	ctx, cancel := context.WithTimeout(f.ctx, s.opts.AttemptTimeout)
 	defer cancel()
 	res, err := conn.Pull(ctx, s.objects, s.opts.Prefix+name, client.PullOptions{})
 	// A reference that is not there is an answer, and the connection it
-	// came over is sound.
-	if err != nil && !errors.Is(err, client.ErrNotFound) {
+	// came over is sound. So is one a pull was ended on.
+	if err != nil && !errors.Is(err, client.ErrNotFound) && f.ctx.Err() == nil {
 		s.drop(gen)
 	}
 	return res, err

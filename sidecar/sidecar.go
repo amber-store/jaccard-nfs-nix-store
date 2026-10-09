@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"net/http"
 	"net/netip"
 	"os"
 	"path/filepath"
@@ -19,6 +20,7 @@ import (
 	"github.com/amber-store/jaccard-nfs-nix-store/materialize"
 	"github.com/amber-store/jaccard-nfs-nix-store/mount"
 	"github.com/amber-store/jaccard-nfs-nix-store/nfsd"
+	"github.com/amber-store/jaccard-nfs-nix-store/preload"
 	"github.com/amber-store/jaccard-nfs-nix-store/refs"
 	"github.com/amber-store/jaccard-nfs-nix-store/tree"
 	"golang.org/x/sys/unix"
@@ -50,6 +52,13 @@ type Config struct {
 	PullJobs        int
 	MaterializeJobs int
 
+	// PreloadListen is the TCP address of the HTTP endpoint that takes
+	// lists of store paths to fetch ahead (package preload). Empty means
+	// there is none.
+	PreloadListen string
+	// PreloadJobs is how many paths of one list are fetched at once.
+	PreloadJobs int
+
 	// AdoptTimeout is how long a mount that an earlier run of the
 	// sidecar left on Mount is given to reach this server before it is
 	// detached and the server mounted anew. Zero means 10 seconds.
@@ -70,6 +79,12 @@ type Sidecar struct {
 	server   *nfsd.Server
 	listener net.Listener
 	served   chan struct{}
+
+	// The preload endpoint, when there is one. endPreloads ends the
+	// requests that are being answered.
+	preloads        *http.Server
+	preloadListener net.Listener
+	endPreloads     context.CancelFunc
 }
 
 // Start opens the cache, serves it on cfg.Listen and, when cfg.Mount
@@ -141,12 +156,58 @@ func Start(cfg Config) (_ *Sidecar, err error) {
 	s.log.Info("serving", "address", s.Addr().String(), "prefix", cfg.Prefix,
 		"cache", cfg.Cache, "pinned", len(s.store.Pins()), "handles", s.table.Len())
 
+	// Before the mount, which is what a pod waits for to start its app
+	// containers: whoever preloads finds the endpoint there.
+	if cfg.PreloadListen != "" {
+		if err := s.servePreloads(); err != nil {
+			return nil, err
+		}
+	}
 	if cfg.Mount != "" {
 		if err := s.mount(); err != nil {
 			return nil, err
 		}
 	}
 	return s, nil
+}
+
+// servePreloads starts the HTTP endpoint that fetches lists of store
+// paths. Its requests run under a context of the sidecar's, so that
+// stopping ends them, and with them the pulls nobody else waits for.
+func (s *Sidecar) servePreloads() error {
+	l, err := net.Listen("tcp", s.cfg.PreloadListen)
+	if err != nil {
+		return fmt.Errorf("the preload endpoint: %w", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	s.preloadListener, s.endPreloads = l, cancel
+	s.preloads = &http.Server{
+		Handler:           preload.New(s.store, s.cfg.PreloadJobs, s.log),
+		ReadHeaderTimeout: 10 * time.Second,
+		BaseContext:       func(net.Listener) context.Context { return ctx },
+	}
+	go func() {
+		if err := s.preloads.Serve(l); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			s.log.Error("the preload endpoint stopped", "error", err)
+		}
+	}()
+	s.log.Info("preloading", "address", l.Addr().String(), "path", preload.Path)
+	return nil
+}
+
+// stopPreloads closes the preload endpoint and ends its requests.
+func (s *Sidecar) stopPreloads() {
+	if s.preloads == nil {
+		return
+	}
+	s.endPreloads()
+	s.preloads.Close()
+}
+
+// PreloadAddr returns the address the preload endpoint listens on. There
+// has to be one.
+func (s *Sidecar) PreloadAddr() netip.AddrPort {
+	return s.preloadListener.Addr().(*net.TCPAddr).AddrPort()
 }
 
 // mount mounts the server on the directory of the configuration.
@@ -242,6 +303,8 @@ func (s *Sidecar) Addr() netip.AddrPort {
 // server, and a server that is gone leaves the dying app, and the pod,
 // to wait for the mount's timeouts.
 func (s *Sidecar) Stop() error {
+	// Nobody is to ask for more while everything is taken down.
+	s.stopPreloads()
 	s.files.Close()
 	var err error
 	if s.cfg.Mount != "" {
@@ -264,6 +327,7 @@ func (s *Sidecar) Stop() error {
 // has in place of a crash.
 func (s *Sidecar) Close() error {
 	var errs []error
+	s.stopPreloads()
 	if s.listener != nil {
 		s.listener.Close()
 		if s.server != nil {

@@ -20,6 +20,7 @@ var variables = []string{
 	"JACCARD_SERVER", "JACCARD_PREFIX", "JACCARD_KEY", "JACCARD_NFS_CACHE", "JACCARD_NFS_LISTEN",
 	"JACCARD_NFS_MOUNT", "JACCARD_NFS_MOUNT_OPTIONS", "JACCARD_NFS_PULL_TIMEOUT",
 	"JACCARD_NFS_PULL_JOBS", "JACCARD_NFS_MATERIALIZE_JOBS",
+	"JACCARD_NFS_PRELOAD_LISTEN", "JACCARD_NFS_PRELOAD_JOBS",
 }
 
 // parse runs the command with the arguments and the environment given and
@@ -65,6 +66,8 @@ func TestTheDefaults(t *testing.T) {
 		pullTimeout:     2 * time.Minute,
 		pullJobs:        4,
 		materializeJobs: 2,
+		preloadListen:   "127.0.0.1:9889",
+		preloadJobs:     20,
 	}
 	if s != want {
 		t.Fatalf("settings\n %+v\nwant\n %+v", s, want)
@@ -83,18 +86,20 @@ func TestEveryFlagAndItsVariable(t *testing.T) {
 		pullTimeout:     90 * time.Second,
 		pullJobs:        7,
 		materializeJobs: 3,
+		preloadListen:   "127.0.0.1:19889",
+		preloadJobs:     50,
 	}
 	flags := []string{
 		"--server", server, "--prefix", "/laptop/nix/store/", "--cache", "/var/cache/store",
 		"--key", "/keys/client.key", "--listen", "127.0.0.1:12049", "--mount", "/export",
 		"--mount-options", "vers=4.1,hard", "--pull-timeout", "90s", "--pull-jobs", "7",
-		"--materialize-jobs", "3",
+		"--materialize-jobs", "3", "--preload-listen", "127.0.0.1:19889", "--preload-jobs", "50",
 	}
 	env := map[string]string{
 		"JACCARD_SERVER": server, "JACCARD_PREFIX": "/laptop/nix/store/", "JACCARD_NFS_CACHE": "/var/cache/store",
 		"JACCARD_KEY": "/keys/client.key", "JACCARD_NFS_LISTEN": "127.0.0.1:12049", "JACCARD_NFS_MOUNT": "/export",
 		"JACCARD_NFS_MOUNT_OPTIONS": "vers=4.1,hard", "JACCARD_NFS_PULL_TIMEOUT": "90s", "JACCARD_NFS_PULL_JOBS": "7",
-		"JACCARD_NFS_MATERIALIZE_JOBS": "3",
+		"JACCARD_NFS_MATERIALIZE_JOBS": "3", "JACCARD_NFS_PRELOAD_LISTEN": "127.0.0.1:19889", "JACCARD_NFS_PRELOAD_JOBS": "50",
 	}
 
 	if s, err := parse(t, nil, flags...); err != nil || s != want {
@@ -109,7 +114,7 @@ func TestEveryFlagAndItsVariable(t *testing.T) {
 		"JACCARD_SERVER": strings.Repeat("0", 63) + "1", "JACCARD_PREFIX": "other/", "JACCARD_NFS_CACHE": "/other",
 		"JACCARD_KEY": "/other.key", "JACCARD_NFS_LISTEN": "127.0.0.1:1", "JACCARD_NFS_MOUNT": "/other",
 		"JACCARD_NFS_MOUNT_OPTIONS": "other", "JACCARD_NFS_PULL_TIMEOUT": "1s", "JACCARD_NFS_PULL_JOBS": "1",
-		"JACCARD_NFS_MATERIALIZE_JOBS": "1",
+		"JACCARD_NFS_MATERIALIZE_JOBS": "1", "JACCARD_NFS_PRELOAD_LISTEN": "127.0.0.1:2", "JACCARD_NFS_PRELOAD_JOBS": "2",
 	}
 	if s, err := parse(t, other, flags...); err != nil || s != want {
 		t.Errorf("flags over variables: %v\n %+v\nwant\n %+v", err, s, want)
@@ -133,7 +138,7 @@ func TestWhatIsRefused(t *testing.T) {
 	full := map[string]string{"--server": server, "--prefix": "p/", "--cache": "/cache"}
 	with := func(change map[string]string) []string {
 		var args []string
-		for _, name := range []string{"--server", "--prefix", "--cache", "--pull-jobs", "--materialize-jobs", "--pull-timeout", "--listen"} {
+		for _, name := range []string{"--server", "--prefix", "--cache", "--pull-jobs", "--materialize-jobs", "--pull-timeout", "--listen", "--preload-jobs"} {
 			value, ok := full[name]
 			if v, changed := change[name]; changed {
 				value, ok = v, v != "\x00"
@@ -149,15 +154,16 @@ func TestWhatIsRefused(t *testing.T) {
 		change map[string]string
 		says   string
 	}{
-		"no server":                 {map[string]string{"--server": absent}, "--server"},
-		"a server that is no ID":    {map[string]string{"--server": "not-an-id"}, "--server"},
-		"no prefix":                 {map[string]string{"--prefix": absent}, "--prefix"},
-		"a prefix no name has":      {map[string]string{"--prefix": "with@sign/"}, "--prefix"},
-		"no cache":                  {map[string]string{"--cache": absent}, "--cache"},
-		"no pull at a time":         {map[string]string{"--pull-jobs": "0"}, "--pull-jobs"},
-		"nothing written at a time": {map[string]string{"--materialize-jobs": "0"}, "--materialize-jobs"},
-		"no time to pull in":        {map[string]string{"--pull-timeout": "0s"}, "--pull-timeout"},
-		"no address to listen on":   {map[string]string{"--listen": ""}, "--listen"},
+		"no server":                   {map[string]string{"--server": absent}, "--server"},
+		"a server that is no ID":      {map[string]string{"--server": "not-an-id"}, "--server"},
+		"no prefix":                   {map[string]string{"--prefix": absent}, "--prefix"},
+		"a prefix no name has":        {map[string]string{"--prefix": "with@sign/"}, "--prefix"},
+		"no cache":                    {map[string]string{"--cache": absent}, "--cache"},
+		"no pull at a time":           {map[string]string{"--pull-jobs": "0"}, "--pull-jobs"},
+		"nothing written at a time":   {map[string]string{"--materialize-jobs": "0"}, "--materialize-jobs"},
+		"no time to pull in":          {map[string]string{"--pull-timeout": "0s"}, "--pull-timeout"},
+		"no address to listen on":     {map[string]string{"--listen": ""}, "--listen"},
+		"no path preloaded at a time": {map[string]string{"--preload-jobs": "0"}, "--preload-jobs"},
 	} {
 		_, err := parse(t, nil, with(c.change)...)
 		if err == nil {
@@ -170,5 +176,20 @@ func TestWhatIsRefused(t *testing.T) {
 	}
 	if _, err := parse(t, nil, append(with(nil), "extra")...); err == nil {
 		t.Error("an argument was taken")
+	}
+}
+
+// The endpoint for preloading is there unless it is told not to be.
+func TestPreloadingCanBeTurnedOff(t *testing.T) {
+	s, err := parse(t, nil, "--server", server, "--prefix", "p/", "--cache", "/cache", "--preload-listen", "")
+	if err != nil {
+		t.Fatalf("no address for the preload endpoint: %v", err)
+	}
+	if s.preloadListen != "" {
+		t.Fatalf("preloadListen %q, want none", s.preloadListen)
+	}
+	s, err = parse(t, map[string]string{"JACCARD_NFS_PRELOAD_LISTEN": ""}, "--server", server, "--prefix", "p/", "--cache", "/cache")
+	if err != nil || s.preloadListen != "" {
+		t.Fatalf("no address in the variable: %q, %v", s.preloadListen, err)
 	}
 }

@@ -8,7 +8,8 @@
 //
 // It serves the references over NFSv4 on loopback and, with --mount,
 // mounts its own server on a directory, which the pod shares with the
-// other containers. Every option is a flag and an environment variable;
+// other containers. It also listens for HTTP on loopback: a list of store
+// paths sent to POST /v1/preload is fetched ahead of any use. Every option is a flag and an environment variable;
 // the flag wins. On SIGTERM it unmounts while it still serves, and ends.
 package main
 
@@ -23,6 +24,7 @@ import (
 	"time"
 
 	"github.com/amber-store/core/reference"
+	"github.com/amber-store/jaccard-nfs-nix-store/preload"
 	"github.com/amber-store/jaccard-nfs-nix-store/sidecar"
 	irohkey "github.com/tmc/go-iroh/key"
 	"github.com/urfave/cli/v2"
@@ -60,6 +62,8 @@ type settings struct {
 	pullTimeout     time.Duration
 	pullJobs        int
 	materializeJobs int
+	preloadListen   string
+	preloadJobs     int
 }
 
 // newApp returns the command. start is what it does once the settings are
@@ -93,6 +97,11 @@ func newApp(start func(ctx context.Context, s settings) error) *cli.App {
 				Usage: "`NUMBER` of references fetched at once"},
 			&cli.IntFlag{Name: "materialize-jobs", EnvVars: []string{"JACCARD_NFS_MATERIALIZE_JOBS"}, Value: 2,
 				Usage: "`NUMBER` of fetched references written out as files at once"},
+			&cli.StringFlag{Name: "preload-listen", EnvVars: []string{"JACCARD_NFS_PRELOAD_LISTEN"}, Value: preload.DefaultListen,
+				Usage: "`ADDRESS` of the HTTP endpoint that takes a list of store paths to fetch ahead, POST " + preload.Path +
+					"; '' is no endpoint"},
+			&cli.IntFlag{Name: "preload-jobs", EnvVars: []string{"JACCARD_NFS_PRELOAD_JOBS"}, Value: preload.DefaultJobs,
+				Usage: "`NUMBER` of store paths of one list fetched at once; they are not counted among --pull-jobs"},
 		},
 		Action: func(c *cli.Context) error {
 			if c.NArg() > 0 {
@@ -120,6 +129,8 @@ func readSettings(c *cli.Context) (settings, error) {
 		pullTimeout:     c.Duration("pull-timeout"),
 		pullJobs:        c.Int("pull-jobs"),
 		materializeJobs: c.Int("materialize-jobs"),
+		preloadListen:   c.String("preload-listen"),
+		preloadJobs:     c.Int("preload-jobs"),
 	}
 	switch {
 	case s.server == "":
@@ -137,6 +148,8 @@ func readSettings(c *cli.Context) (settings, error) {
 		return settings{}, fmt.Errorf("--pull-jobs: %d is not a number of references to fetch at once: want 1 or more", s.pullJobs)
 	case s.materializeJobs < 1:
 		return settings{}, fmt.Errorf("--materialize-jobs: %d is not a number of references to write out at once: want 1 or more", s.materializeJobs)
+	case s.preloadJobs < 1:
+		return settings{}, fmt.Errorf("--preload-jobs: %d is not a number of store paths to fetch at once: want 1 or more", s.preloadJobs)
 	}
 	if _, err := irohkey.ParseEndpointID(s.server); err != nil {
 		return settings{}, fmt.Errorf("--server: not an endpoint ID: %w", err)

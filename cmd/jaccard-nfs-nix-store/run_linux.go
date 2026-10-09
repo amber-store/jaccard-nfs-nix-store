@@ -44,6 +44,8 @@ func run(ctx context.Context, s settings) error {
 		PullTimeout:     s.pullTimeout,
 		PullJobs:        s.pullJobs,
 		MaterializeJobs: s.materializeJobs,
+		PreloadListen:   s.preloadListen,
+		PreloadJobs:     s.preloadJobs,
 		Log:             log,
 	})
 	if err != nil {

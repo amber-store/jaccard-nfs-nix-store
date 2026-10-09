@@ -55,6 +55,16 @@ that is killed and restarted leaves the app running.
   **materialized** on disk at the same time; once it is materialized, its
   files are served from there. That is more to build, and is for the sake
   of reads.
+- Store paths can be **preloaded**: the sidecar listens for HTTP on
+  `localhost:9889` and takes, with a POST to `/v1/preload`, a list of Nix
+  paths, one to a line. It fetches them all, in parallel with an errgroup
+  and its context, 20 at a time, and answers 200 or an error that fits.
+  The first path that cannot be fetched ends the others. The address and
+  the number are options.
+- The pulls of a preload are **not counted among `--pull-jobs`**, which
+  stay the lookups', and a preload that ends, **ends the pulls that are
+  running for it** too, unless a lookup waits for the same path. (Asked;
+  the proposals were one shared limit, and to let running pulls finish.)
 - A sample application is deployed when the sidecar works. Its entry point
   is the owner's to name, and is asked for then.
 
@@ -265,10 +275,11 @@ The inode number is the first eight bytes of the handle.
 5. The reference is queued to be materialized (section 6). `Ensure` does
    not wait for that.
 
-- Lookups of one name at the same moment share one pull. At most
-  `--pull-jobs` pulls run at once; the others wait.
-- A pull belongs to no request. A client that gives up does not end it,
-  and whoever asks next finds it running or done.
+- Whoever asks for one name at the same moment shares one pull. At most
+  `--pull-jobs` pulls that lookups began run at once; the others wait.
+- A pull that a lookup asked for belongs to no request. A client that
+  gives up does not end it, and whoever asks next finds it running or
+  done. The pull of a preload is another matter (5.1).
 - A pull that fails for any reason but a missing reference is tried again,
   after 1 s and then twice as long each time up to 15 s, with a new
   connection, until `--pull-timeout` has passed since the first failure.
@@ -285,6 +296,44 @@ The inode number is the first eight bytes of the handle.
   under another prefix is refused at start: its pins would be answered as
   names of references they never were.
 - Nothing is ever removed from the cache.
+
+### 5.1 Preloading
+
+The sidecar listens for HTTP on `--preload-listen`, by default
+`127.0.0.1:9889`, which the containers of a pod share. `POST /v1/preload`
+takes a list of store paths, one to a line, and fetches them all before
+anything looks them up.
+
+- A line is a path under `/nix/store`, of which the store path it lies in
+  is taken (`/nix/store/<hash>-<name>/bin/x` is `<hash>-<name>`), or the
+  name of a store path by itself. Lines with nothing on them are skipped,
+  spaces around a line and a carriage return at its end are dropped, and a
+  path that is named twice is fetched once. Any other line refuses the
+  whole list with 400 and its number, before anything is fetched. A list
+  of more than 16 MiB is 413.
+- **Fetched** is what it is for a lookup: the reference is pulled, pinned
+  and served from then on, and queued to be materialized, which is not
+  waited for. A path that is pinned already is fetched.
+- The paths are fetched `--preload-jobs` at a time, 20 by default, by an
+  errgroup under the context of the request. Their pulls take none of the
+  `--pull-jobs`. A preload that asks for a path a lookup is already
+  pulling shares that pull and waits as the lookup does.
+- The answer is **200** and `fetched N paths` when all are there.
+- The **first path that fails** ends the context: no further path is
+  begun, and the pulls that are running are ended, each unless another
+  preload still waits for it or a lookup has asked for the same path.
+  Nothing of an ended pull is pinned. The objects it had brought stay in
+  the packstore and are not fetched again when the path next is.
+- What the answer then says is that first failure: **404** and the path
+  when the server has no such reference, **502** with the path and the
+  reason when it could not be fetched, which is after `--pull-timeout` of
+  trying, as for a lookup.
+- A request that is given up by whoever sent it ends the same way, and so
+  does every request when the sidecar is told to stop: the endpoint is
+  the first thing to close.
+- Anything but a POST is 405, any other path 404. There is no
+  authentication: whoever reaches the address can make the sidecar fetch
+  what a lookup would fetch as well.
 
 ## 6. Materializing
 
@@ -419,6 +468,8 @@ jaccard-nfs-nix-store --server ENDPOINT_ID --prefix PREFIX --cache DIR [--mount 
 | `--pull-timeout D` | `JACCARD_NFS_PULL_TIMEOUT` | `2m` |
 | `--pull-jobs N` | `JACCARD_NFS_PULL_JOBS` | `4` |
 | `--materialize-jobs N` | `JACCARD_NFS_MATERIALIZE_JOBS` | `2` |
+| `--preload-listen ADDR` | `JACCARD_NFS_PRELOAD_LISTEN` | `127.0.0.1:9889`; `''` is no endpoint |
+| `--preload-jobs N` | `JACCARD_NFS_PRELOAD_JOBS` | `20` |
 
 `urfave/cli/v2`; a flag wins over its variable. The cache directory holds
 `packstore/`, `files/`, `refs`, `handles`, `origin` and the key. The log is `slog`
@@ -465,6 +516,10 @@ spec:
   makes the directory a mount point.
 - There is no `preStop` hook: the process unmounts on SIGTERM, and a
   sidecar is stopped after the app containers.
+- An init container after the sidecar can send the closure of the app to
+  `http://127.0.0.1:9889/v1/preload`: the app then starts with everything
+  it needs in the store. A sidecar is started before the init containers
+  that follow it.
 - The node needs the kernel's NFSv4.1 client and a kubelet root that is
   `rshared`.
 - The image is Alpine with the one command, which runs as root; `grep`
@@ -475,7 +530,8 @@ spec:
 ```
 cmd/jaccard-nfs-nix-store/   the command: the flags, and a sidecar until the signal
 sidecar/   the parts put together, the mount, the order of the end (Linux)
-refs/      Ensure, the pins, the connection, the retries
+refs/      Ensure and Preload, the pins, the connection, the retries
+preload/   the HTTP endpoint that fetches a list of store paths
 tree/      lookup, listing and reading over core's objects; the caches
 materialize/  a reference written out as files; which are whole; the queue
 handles/   the handle of a path; the table and its file
@@ -490,8 +546,8 @@ deploy/    the pod of section 10
 docs/
 ```
 
-`refs`, `tree`, `materialize`, `handles` and `reclog` import nothing of
-Buildbarn and build everywhere, and so do the parts of `mount`, `sidecar`
+`refs`, `preload`, `tree`, `materialize`, `handles` and `reclog` import
+nothing of Buildbarn and build everywhere, and so do the parts of `mount`, `sidecar`
 and the command that touch neither Buildbarn nor `mount(2)`: the reading
 of a mount table, the order of the unmount, the flags. `nfsd`, the rest of
 those three and `e2e` are Linux only, by build tag. `refs` reaches the
@@ -534,6 +590,20 @@ Tests are written before the code they cover.
   opened for another server or prefix; pins read back after a restart; a pin
   only after the objects are synced; a pinned reference handed on to be
   materialized, once.
+- `refs`, preloads: a pull that takes none of the jobs, beside lookups
+  that take theirs; a preload that is given up ends its pull and not the
+  connection, and the name is fetched anew when it is asked for; a lookup
+  that waits for the same name keeps the pull going, whichever came
+  first, also one whose own request has ended; two preloads of a name end
+  its pull when the second gives up; whoever asks right after a pull was
+  ended gets a pull of their own; closing with preloads under way.
+- `preload`, against a fake of the fetching: the lines that are taken and
+  the names they come to; lists of nothing; each line that is none,
+  refused with its number before anything is fetched; a path the server
+  does not have and one that cannot be fetched; never more at once than
+  the jobs, and all of them; one failure that ends the ones that run and
+  begins no other; a request that is given up; other methods and paths;
+  a list that is too long.
 - `refs`, end to end in one process: a jaccard-store server with a real
   iroh endpoint on loopback and an in-memory S3, directories pushed with
   jaccard-store's client, a base pack and a patch pack fetched through
@@ -570,7 +640,9 @@ Tests are written before the code they cover.
   sidecar is stopped, which has to end at once; a sidecar stopped while a
   file of the store is open, whose mount has to be out of the tree at
   once; and a mount left by a sidecar that listened on another port, which
-  the next one has to replace. They are skipped without
+  the next one has to replace; and a list of paths preloaded over HTTP,
+  which are in the mount's listing before anyone looked them up. They are
+  skipped without
   root and run in CI under `sudo` and locally in a privileged container.
 - By hand before the deployment: the image in a privileged container
   against the real server, a program run out of a fetched store path.
@@ -622,4 +694,6 @@ not have.
   read-size wrapper depends on which attributes Buildbarn writes; an
   attribute it does not know makes it step aside, and reads are 1024 bytes
   again.
+- A preload that joins a pull a lookup began waits for one of the lookups'
+  jobs, as that pull does.
 - The sidecar is privileged.

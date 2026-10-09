@@ -12,6 +12,7 @@ import (
 	"io/fs"
 	"log/slog"
 	"math/rand/v2"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -23,6 +24,7 @@ import (
 
 	"github.com/amber-store/jaccard-nfs-nix-store/jstest"
 	"github.com/amber-store/jaccard-nfs-nix-store/mount"
+	"github.com/amber-store/jaccard-nfs-nix-store/preload"
 	"github.com/amber-store/jaccard-nfs-nix-store/refs"
 	"github.com/amber-store/jaccard-nfs-nix-store/sidecar"
 	"golang.org/x/sys/unix"
@@ -720,5 +722,91 @@ func TestALeftoverMountThatDoesNotReachTheSidecar(t *testing.T) {
 	}
 	if n := mountsOn(t, mnt); n != 0 {
 		t.Errorf("%d NFS mounts on the directory after the stop", n)
+	}
+}
+
+// A list of store paths sent to the sidecar is fetched before anything
+// looks the paths up: they are in the store when the answer comes.
+func TestPreloading(t *testing.T) {
+	if os.Getuid() != 0 {
+		t.Skip("mounting needs root: scripts/test-linux.sh runs this in a privileged container")
+	}
+	srv := jstest.Start(t)
+	src := t.TempDir()
+	paths := []string{"aaa-one-1.0", "bbb-two-2.0", "ccc-three-3.0", "ddd-four-4.0"}
+	for _, name := range paths {
+		write(t, filepath.Join(src, name, "share", "name"), []byte(name+"\n"), 0o644)
+		srv.PushDir(filepath.Join(src, name), prefix+name)
+	}
+
+	mnt, cache := t.TempDir(), t.TempDir()
+	t.Cleanup(func() { mount.Detach(mnt) })
+	sc, err := sidecar.Start(sidecar.Config{
+		Prefix: prefix,
+		Cache:  cache,
+		Dial: func(ctx context.Context) (refs.Conn, error) {
+			return refs.Connect(ctx, srv.DialConfig())
+		},
+		Listen:        "127.0.0.1:0",
+		Mount:         mnt,
+		MountOptions:  sidecar.DefaultMountOptions,
+		PreloadListen: "127.0.0.1:0",
+		PreloadJobs:   2,
+		Log:           slog.New(slog.NewTextHandler(logTo{t}, nil)),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sc.Stop()
+	url := "http://" + sc.PreloadAddr().String() + preload.Path
+	post := func(list string) (int, string) {
+		t.Helper()
+		res, err := http.Post(url, "text/plain", strings.NewReader(list))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer res.Body.Close()
+		body, err := io.ReadAll(res.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return res.StatusCode, string(body)
+	}
+
+	if got := names(t, mnt, nil); len(got) != 0 {
+		t.Fatalf("the store holds %q before anything was asked for", got)
+	}
+	// A path of the store, a path into one, and a name by itself.
+	status, body := post("/nix/store/aaa-one-1.0\n/nix/store/bbb-two-2.0/share/name\nccc-three-3.0\n")
+	if status != http.StatusOK || body != "fetched 3 paths\n" {
+		t.Fatalf("status %d: %s", status, body)
+	}
+	// They are in the store, and nobody has looked one of them up: the
+	// root lists what was fetched.
+	got := names(t, mnt, nil)
+	slices.Sort(got)
+	if want := paths[:3]; !slices.Equal(got, want) {
+		t.Fatalf("after the preload the store holds %q, want %q", got, want)
+	}
+	for _, name := range paths[:3] {
+		if content, err := os.ReadFile(filepath.Join(mnt, name, "share", "name")); err != nil || string(content) != name+"\n" {
+			t.Errorf("%s: %q, %v", name, content, err)
+		}
+	}
+
+	// What is there is not fetched again.
+	if status, body := post("aaa-one-1.0\nbbb-two-2.0\n"); status != http.StatusOK || body != "fetched 2 paths\n" {
+		t.Errorf("a list of what is there: status %d: %s", status, body)
+	}
+	// A path the server does not have ends the request and is named.
+	status, body = post("/nix/store/ddd-four-4.0\n/nix/store/zzz-missing-0.0/bin/x\n")
+	if status != http.StatusNotFound || !strings.Contains(body, "/nix/store/zzz-missing-0.0") {
+		t.Errorf("a list with a missing path: status %d: %s", status, body)
+	}
+	if status, body := post("/etc/passwd\n"); status != http.StatusBadRequest {
+		t.Errorf("a list with a line that is no path: status %d: %s", status, body)
+	}
+	if res, err := http.Get(url); err != nil || res.StatusCode != http.StatusMethodNotAllowed {
+		t.Errorf("a GET: %v, %v", res, err)
 	}
 }
