@@ -140,6 +140,10 @@ container.
 - The parts are put together in a package of their own, `sidecar`, which
   the command starts and the end-to-end tests start too: what is tested
   with the kernel is what runs.
+- A mount that is in use when the sidecar is told to stop is detached at
+  once and not waited for, and a mount that an earlier run left is served
+  again only if the kernel behind it reaches the server (section 8). Both
+  came of asking what leaves a mount on a node (8.1).
 - The first deployment found that a sidecar must not stop serving the
   moment it has unmounted (section 8): an app that ignored SIGTERM was
   killed as the sidecar was stopped, and hung in its own exit for the
@@ -342,14 +346,22 @@ the background, while it is already served from the objects.
   `--mount-options`. The default options are
   `vers=4.1,soft,timeo=600,retrans=2,lookupcache=positive`.
 - If DIR is an NFS mount already, it is the mount of an earlier run of the
-  sidecar in the same pod: nothing is mounted, and the kernel finds the
-  server again at the address it knows. This is what the handles are
-  stable for.
+  sidecar, which ended without unmounting. In the same pod and at the
+  same address the kernel finds the server again, nothing is mounted, and
+  a file that was open is read on: this is what the handles are stable
+  for. Whether the kernel does find the server is tried: the mount is
+  given a reason to ask (a `statfs`) and 10 s for a connection to arrive.
+  The kernel looks for the server where the mount was made, so a mount of
+  another network namespace, as after the pod's sandbox was made anew, or
+  of another port never arrives. Such a mount is detached and the server
+  mounted in its place.
 - Without `--mount` the process only serves.
 - On SIGTERM or SIGINT the process unmounts DIR **while it still serves**:
-  a plain unmount, tried for 2 s while it is refused as busy, then a
-  detaching one. The server then goes on **until the kernel has let go of
-  it**: until no client has been connected for 250 ms, and for 5 s at the
+  a plain unmount, and a detaching one at once when that is refused as
+  busy. A mount in use is not waited for: the kubelet may leave a sidecar
+  two seconds between the signal and the kill, and does so just when the
+  mount is in use. The server then goes on **until the kernel has let go
+  of it**: until no client has been connected for 250 ms, and for 5 s at the
   most. Then the table is flushed and the process ends. A second signal
   ends it at once. Materializing stops with the first signal; what it had
   begun is removed at the next start.
@@ -361,10 +373,33 @@ the background, while it is already served from the objects.
   its session. It closes its connection when it is done, and makes one at
   once if it has none and needs the server, which is what the 250 ms are
   for.
-- `timeo` and `retrans` bound two things: how long a request may take
-  before the app sees `EIO` (a fetch of more than three minutes, at the
-  default), and how long a pod's end is held up when the sidecar is killed
-  with the mount in place (twice that).
+- `timeo` and `retrans` bound how long a request may take before the app
+  sees `EIO` (a fetch of more than three minutes, at the default), and how
+  long anything that touches a mount without a server waits.
+
+### 8.1 A mount that is left on the node
+
+The mount reaches the node through the propagation that carries it to the
+app containers, and only the sidecar takes it away again: by unmounting,
+which goes the same way back. A sidecar that ends without unmounting
+leaves the mount on the node, under the pod's volume directory. Its mount
+namespace ending takes nothing with it.
+
+- A sidecar **told to stop** unmounts first, in a few milliseconds, also
+  when the mount is in use. Tried: on the cluster the node's mount table
+  was read before and after a pod was replaced, and the mount was gone.
+- A sidecar that is **killed while the pod lives on** (out of memory, a
+  crash) is started again, finds the mount and serves it again, or
+  replaces it. Tried, for both.
+- A sidecar that is **killed as the pod ends** leaves the mount for good.
+  That takes a kill without the signal before it: the kill of the whole
+  pod at once, as when its sandbox dies under a shared process namespace,
+  or a sidecar that hangs. The mount then has no server. A directory with
+  a mount on it cannot be removed (tried), so the pod's volume is expected
+  to stay and the pod to stay Terminating until the mount is taken away on
+  the node, with `umount -l` of the path; the kubelet's part in this was
+  not tried.
+- A **node that restarts** has no mounts left.
 
 ## 9. Command
 
@@ -514,11 +549,11 @@ Tests are written before the code they cover.
   attribute it does not know.
 - `mount`: a mount table read: the mount on top of two on one point, a
   path with an escaped space, a path a mount point only begins with.
-- `sidecar`: the order of the unmount against a kernel that is busy for a
-  moment, stays busy, has nothing mounted, or fails.
+- `sidecar`: the unmount against a kernel that is busy, has nothing
+  mounted, or fails.
 - `nfsd`, the server: an accept that fails is tried again; the wait for
   the server to be idle, with a client connected, after it went, and with
-  clients that keep coming.
+  clients that keep coming; the wait for a client to come.
 - The command: every flag against its variable, the flag over the
   variable, the defaults, and what is refused.
 - `e2e`, with the kernel, as root: a sidecar started on the server of the
@@ -532,7 +567,10 @@ Tests are written before the code they cover.
   settled on; the sidecar closed and started again under the mount with a
   file open; the unmount of section 8; and a process in a mount namespace
   of its own that is killed, with a file of the store open, as the
-  sidecar is stopped, which has to end at once. They are skipped without
+  sidecar is stopped, which has to end at once; a sidecar stopped while a
+  file of the store is open, whose mount has to be out of the tree at
+  once; and a mount left by a sidecar that listened on another port, which
+  the next one has to replace. They are skipped without
   root and run in CI under `sudo` and locally in a privileged container.
 - By hand before the deployment: the image in a privileged container
   against the real server, a program run out of a fetched store path.
@@ -565,11 +603,15 @@ not have.
 - A name that could not be fetched after `--pull-timeout` is `EIO`, not
   `ENOENT`; a name that is missing is `ENOENT` for the next 5 s even if it
   is pushed meanwhile.
-- A sidecar killed while mounted, as the pod ends, holds the end of the
-  pod up for up to six minutes, and so does one that is stopped while an
-  app still runs and has files of the store open: the kubelet stops a
-  sidecar after the app containers, but gives it two seconds when the
-  pod's grace period has run out.
+- A sidecar that is killed as its pod ends, without the signal to stop
+  before it, leaves its mount on the node (8.1). Nothing in the pod can
+  prevent that; a mount that the kubelet makes and takes away itself, as
+  for a CSI driver, would.
+- A sidecar that is stopped while an app still runs and has files of the
+  store open leaves that app with a store that answers nothing: its
+  requests fail when the mount's timeouts run out. The kubelet stops a
+  sidecar after the app containers, but all at once when the pod's grace
+  period has run out.
 - After a restart of the sidecar a file that was open stays readable, but
   byte-range locks are gone. Nothing in a read-only store takes them.
 - Permissions are `0444` and `0555` whatever was recorded; setuid, setgid

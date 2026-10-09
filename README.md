@@ -100,7 +100,9 @@ volumes:
 - **A sidecar that is restarted** finds its mount still there and serves
   it again: file handles are derived from paths and kept in the cache, so
   what the kernel holds still means what it meant. A file that was open
-  stays readable.
+  stays readable. If the kernel behind the mount cannot reach the new
+  sidecar within ten seconds, as when the pod's sandbox and with it the
+  network namespace was made anew, the mount is replaced.
 
 ## Command
 
@@ -172,9 +174,15 @@ authentication, which is why it listens on loopback.
   the app had open, which takes a moment. `shareProcessNamespace: true`
   in the pod, or an init process in the container, makes such a program
   end when it is asked to.
-- **A sidecar killed with its mount in place**, as the pod ends, holds the
-  end of the pod up for as long as two request timeouts: six minutes with
-  the default options.
+- **The mount reaches the node**, which is how it reaches the app
+  container, and only the sidecar takes it away again. Told to stop, it
+  unmounts first, within milliseconds and also while the mount is in use.
+  A sidecar that is *killed* as its pod ends, without having been told to
+  stop, leaves the mount on the node under the pod's volume directory,
+  where it has no server; the pod's volume cannot be removed until it is
+  taken away there: `umount -l /var/lib/kubelet/pods/<uid>/volumes/kubernetes.io~empty-dir/<volume>`.
+  `findmnt -t nfs4` on a node shows what is mounted: one mount for every
+  pod that runs, and none for one that is gone.
 
 ## Development
 

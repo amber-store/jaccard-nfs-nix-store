@@ -21,6 +21,7 @@ import (
 	"github.com/amber-store/jaccard-nfs-nix-store/nfsd"
 	"github.com/amber-store/jaccard-nfs-nix-store/refs"
 	"github.com/amber-store/jaccard-nfs-nix-store/tree"
+	"golang.org/x/sys/unix"
 )
 
 // Config is what a sidecar is started with. Zero values of the numbers
@@ -48,6 +49,11 @@ type Config struct {
 	PullTimeout     time.Duration
 	PullJobs        int
 	MaterializeJobs int
+
+	// AdoptTimeout is how long a mount that an earlier run of the
+	// sidecar left on Mount is given to reach this server before it is
+	// detached and the server mounted anew. Zero means 10 seconds.
+	AdoptTimeout time.Duration
 
 	// Log receives what the sidecar does. Nil means slog.Default().
 	Log *slog.Logger
@@ -143,25 +149,81 @@ func Start(cfg Config) (_ *Sidecar, err error) {
 	return s, nil
 }
 
-// mount mounts the server on the directory of the configuration, unless
-// an NFS mount is there already. That one is the mount of an earlier run
-// of the sidecar in the same pod, which ended without unmounting: the
-// kernel finds the server again at the address it knows, and what it
-// holds of handles means what it meant, so there is nothing to mount.
+// mount mounts the server on the directory of the configuration.
+//
+// An NFS mount that is there already is the mount of an earlier run of
+// the sidecar, which ended without unmounting. In the same pod and at the
+// same address the kernel finds the server again, and what it holds of
+// handles means what it meant: that mount is served again, and whoever had
+// a file of it open goes on reading. But the kernel looks for the server
+// where the mount was made, and a mount of another network namespace (the
+// pod's sandbox was made anew) or of another port never finds this one. It
+// would be a store that answers nobody, so it is taken away and the
+// server mounted in its place.
 func (s *Sidecar) mount() error {
-	fstype, mounted, err := mount.Mounted(s.cfg.Mount)
+	dir := s.cfg.Mount
+	fstype, mounted, err := mount.Mounted(dir)
 	if err != nil {
 		return err
 	}
 	if mounted && strings.HasPrefix(fstype, "nfs") {
-		s.log.Info("the mount of an earlier run is there, and is served again", "mount", s.cfg.Mount)
-		return nil
+		wait := s.cfg.AdoptTimeout
+		if wait <= 0 {
+			wait = adoptFor
+		}
+		if s.reached(dir, wait) {
+			s.log.Info("the mount of an earlier run is there, and is served again", "mount", dir)
+			return nil
+		}
+		s.log.Warn("the mount of an earlier run does not reach this server: it is detached, and the server mounted anew",
+			"mount", dir, "waited", wait)
+		if err := s.discard(dir); err != nil {
+			return err
+		}
 	}
-	if err := mount.Mount(s.cfg.Mount, s.Addr(), s.cfg.MountOptions); err != nil {
+	if err := mount.Mount(dir, s.Addr(), s.cfg.MountOptions); err != nil {
 		return err
 	}
-	s.log.Info("mounted", "mount", s.cfg.Mount, "options", s.cfg.MountOptions)
+	s.log.Info("mounted", "mount", dir, "options", s.cfg.MountOptions)
 	return nil
+}
+
+// reached reports whether the kernel behind the mount on dir connects to
+// this server within wait. It is given a reason to: a statfs, which is
+// asked of the server every time. On a mount that is dead the statfs
+// waits for the mount's timeouts, which nobody here waits for.
+func (s *Sidecar) reached(dir string, wait time.Duration) bool {
+	go func() {
+		var st unix.Statfs_t
+		unix.Statfs(dir, &st)
+	}()
+	return s.server.WaitClient(wait)
+}
+
+// discard takes a dead mount off dir. The detaching takes the mount out
+// of the tree at once and then, in the same call, lets go of the file
+// system, which waits for its server as long as the mount's timeouts
+// allow: the call is left to end by itself.
+func (s *Sidecar) discard(dir string) error {
+	go func() {
+		if err := mount.Detach(dir); err != nil && !errors.Is(err, unix.EINVAL) {
+			s.log.Warn("detaching the mount of an earlier run", "mount", dir, "error", err)
+		}
+	}()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		fstype, mounted, err := mount.Mounted(dir)
+		if err != nil {
+			return err
+		}
+		if !mounted || !strings.HasPrefix(fstype, "nfs") {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("the dead mount of an earlier run is still on %s", dir)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 }
 
 // Addr returns the address the NFS server listens on.
@@ -183,7 +245,7 @@ func (s *Sidecar) Stop() error {
 	s.files.Close()
 	var err error
 	if s.cfg.Mount != "" {
-		err = leaver{unmount: mount.Unmount, detach: mount.Detach, sleep: time.Sleep, log: s.log}.leave(s.cfg.Mount)
+		err = leaver{unmount: mount.Unmount, detach: mount.Detach, log: s.log}.leave(s.cfg.Mount)
 		if err == nil {
 			s.log.Info("unmounted", "mount", s.cfg.Mount)
 			if !s.server.WaitIdle(lingerFor, settleFor) {

@@ -185,6 +185,46 @@ func TestWaitIdle(t *testing.T) {
 	<-knocked
 }
 
+func TestWaitClient(t *testing.T) {
+	w := newWorld(t)
+	srv := NewServer(w.fs)
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	go srv.Serve(l)
+	defer srv.Close()
+
+	began := time.Now()
+	if srv.WaitClient(100 * time.Millisecond) {
+		t.Fatal("a client was seen that never came")
+	}
+	if took := time.Since(began); took < 100*time.Millisecond {
+		t.Fatalf("it gave up after %v, before its limit", took)
+	}
+
+	came := make(chan bool, 1)
+	go func() { came <- srv.WaitClient(10 * time.Second) }()
+	c, err := net.Dial("tcp", l.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case ok := <-came:
+		if !ok {
+			t.Fatal("the client that came was not seen")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the client that came was not seen")
+	}
+	// It came, and that it went again changes nothing.
+	c.Close()
+	if !srv.WaitClient(time.Millisecond) {
+		t.Fatal("a client that came and went counts as none")
+	}
+}
+
 func isReset(err error) bool {
 	_, ok := err.(*net.OpError)
 	return ok

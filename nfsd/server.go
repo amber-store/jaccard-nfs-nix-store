@@ -215,6 +215,28 @@ func (s *Server) WaitIdle(limit, settle time.Duration) bool {
 	}
 }
 
+// WaitClient waits until a client has connected, now or ever before, and
+// reports whether one did within limit.
+//
+// It is how a sidecar that finds a mount of an earlier run knows that the
+// kernel behind that mount reaches this server: only then is the mount one
+// to serve.
+func (s *Server) WaitClient(limit time.Duration) bool {
+	deadline := time.Now().Add(limit)
+	for {
+		s.mu.Lock()
+		accepted := s.accepted
+		s.mu.Unlock()
+		if accepted > 0 {
+			return true
+		}
+		if !time.Now().Before(deadline) {
+			return false
+		}
+		time.Sleep(idlePoll)
+	}
+}
+
 // Close closes every connection and waits for their serving to end. The
 // listener is the caller's to close. Closing twice is no error.
 func (s *Server) Close() error {

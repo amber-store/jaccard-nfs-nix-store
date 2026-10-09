@@ -6,40 +6,36 @@ import (
 	"io"
 	"log/slog"
 	"testing"
-	"time"
 
 	"golang.org/x/sys/unix"
 )
 
-// kernel is the mount package as a test wants it: it refuses to unmount as
-// busy so many times, and records what was done.
+// kernel is the mount package as a test wants it: its unmount fails with
+// what the test says, and it records what was done.
 type kernel struct {
-	busy     int   // unmounts that are still refused as busy
-	fail     error // what unmount fails with instead
-	unmounts int
-	detached bool
-	slept    time.Duration
+	fail       error // what unmount fails with
+	detachFail error // what detach fails with
+	unmounts   int
+	detaches   int
 }
 
 func (k *kernel) leaver() leaver {
 	return leaver{
 		unmount: func(string) error {
 			k.unmounts++
-			switch {
-			case k.fail != nil:
+			if k.fail != nil {
 				return fmt.Errorf("unmounting: %w", k.fail)
-			case k.busy > 0:
-				k.busy--
-				return fmt.Errorf("unmounting: %w", unix.EBUSY)
 			}
 			return nil
 		},
 		detach: func(string) error {
-			k.detached = true
+			k.detaches++
+			if k.detachFail != nil {
+				return fmt.Errorf("detaching: %w", k.detachFail)
+			}
 			return nil
 		},
-		sleep: func(d time.Duration) { k.slept += d },
-		log:   slog.New(slog.NewTextHandler(io.Discard, nil)),
+		log: slog.New(slog.NewTextHandler(io.Discard, nil)),
 	}
 }
 
@@ -48,35 +44,22 @@ func TestLeavingAMountThatIsNotInUse(t *testing.T) {
 	if err := k.leaver().leave("/export"); err != nil {
 		t.Fatal(err)
 	}
-	if k.unmounts != 1 || k.detached || k.slept != 0 {
-		t.Fatalf("%d unmounts, detached %v, %v slept: want one unmount and nothing else", k.unmounts, k.detached, k.slept)
+	if k.unmounts != 1 || k.detaches != 0 {
+		t.Fatalf("%d unmounts, %d detaches: want one unmount and nothing else", k.unmounts, k.detaches)
 	}
 }
 
-func TestLeavingAMountThatIsBusyForAMoment(t *testing.T) {
-	k := &kernel{busy: 3}
+// A mount that is in use is detached at once and not waited for: the
+// kubelet may give a sidecar two seconds between telling it to stop and
+// killing it, and a sidecar that is killed with its mount in place leaves
+// the mount on the node.
+func TestLeavingAMountThatIsInUse(t *testing.T) {
+	k := &kernel{fail: unix.EBUSY}
 	if err := k.leaver().leave("/export"); err != nil {
 		t.Fatal(err)
 	}
-	if k.unmounts != 4 || k.detached {
-		t.Fatalf("%d unmounts, detached %v: want it unmounted at the fourth try", k.unmounts, k.detached)
-	}
-	if k.slept != 3*busyEvery {
-		t.Fatalf("%v slept, want %v", k.slept, 3*busyEvery)
-	}
-}
-
-func TestLeavingAMountThatStaysBusy(t *testing.T) {
-	k := &kernel{busy: 1_000_000}
-	if err := k.leaver().leave("/export"); err != nil {
-		t.Fatal(err)
-	}
-	if !k.detached {
-		t.Fatal("a mount that stayed busy was not detached")
-	}
-	// It was tried for busyFor and no longer.
-	if k.slept != busyFor {
-		t.Fatalf("%v slept, want %v", k.slept, busyFor)
+	if k.unmounts != 1 || k.detaches != 1 {
+		t.Fatalf("%d unmounts, %d detaches: want it detached after the one unmount that was refused", k.unmounts, k.detaches)
 	}
 }
 
@@ -85,18 +68,22 @@ func TestLeavingWhereNothingIsMounted(t *testing.T) {
 	if err := k.leaver().leave("/export"); err != nil {
 		t.Fatalf("nothing mounted is nothing to leave: %v", err)
 	}
-	if k.unmounts != 1 || k.detached {
-		t.Fatalf("%d unmounts, detached %v", k.unmounts, k.detached)
+	if k.unmounts != 1 || k.detaches != 0 {
+		t.Fatalf("%d unmounts, %d detaches", k.unmounts, k.detaches)
 	}
 }
 
 func TestLeavingFails(t *testing.T) {
 	k := &kernel{fail: unix.EPERM}
-	err := k.leaver().leave("/export")
-	if !errors.Is(err, unix.EPERM) {
+	if err := k.leaver().leave("/export"); !errors.Is(err, unix.EPERM) {
 		t.Fatalf("err = %v, want the failure of the unmount", err)
 	}
-	if k.unmounts != 1 || k.detached {
-		t.Fatalf("%d unmounts, detached %v: a failure that is not busy is not tried again", k.unmounts, k.detached)
+	if k.unmounts != 1 || k.detaches != 0 {
+		t.Fatalf("%d unmounts, %d detaches: a failure that is not busy is not answered with a detach", k.unmounts, k.detaches)
+	}
+
+	k = &kernel{fail: unix.EBUSY, detachFail: unix.EPERM}
+	if err := k.leaver().leave("/export"); !errors.Is(err, unix.EPERM) {
+		t.Fatalf("err = %v, want the failure of the detach", err)
 	}
 }

@@ -541,3 +541,184 @@ func TestAProcessKilledAsTheSidecarStops(t *testing.T) {
 		t.Errorf("after the stop: mounted %v, %v", mounted, err)
 	}
 }
+
+// A sidecar that is told to stop while its mount is in use takes the
+// mount out of the tree at once, and serves on for whoever still has a
+// file of it open.
+func TestStoppingWhileAFileIsOpen(t *testing.T) {
+	if os.Getuid() != 0 {
+		t.Skip("mounting needs root: scripts/test-linux.sh runs this in a privileged container")
+	}
+	srv := jstest.Start(t)
+	dir := filepath.Join(t.TempDir(), "path")
+	data := randomBytes(1<<20, 5)
+	write(t, filepath.Join(dir, "data"), data, 0o644)
+	srv.PushDir(dir, prefix+"path")
+
+	mnt, cache := t.TempDir(), t.TempDir()
+	t.Cleanup(func() { mount.Detach(mnt) })
+	sc, err := sidecar.Start(sidecar.Config{
+		Prefix: prefix,
+		Cache:  cache,
+		Dial: func(ctx context.Context) (refs.Conn, error) {
+			return refs.Connect(ctx, srv.DialConfig())
+		},
+		Listen:       "127.0.0.1:0",
+		Mount:        mnt,
+		MountOptions: "vers=4.1,soft,timeo=50,retrans=1,lookupcache=positive",
+		Log:          slog.New(slog.NewTextHandler(logTo{t}, nil)),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	open, err := os.Open(filepath.Join(mnt, "path", "data"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer open.Close()
+
+	began := time.Now()
+	stopped := make(chan error, 1)
+	go func() { stopped <- sc.Stop() }()
+
+	// The mount is gone from the tree long before the sidecar is: it was
+	// not waited for.
+	for {
+		_, mounted, err := mount.Mounted(mnt)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !mounted {
+			break
+		}
+		if time.Since(began) > time.Second {
+			t.Fatal("a second after it was told to stop, the sidecar's mount is still in the tree")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Logf("the mount was out of the tree after %v", time.Since(began))
+	select {
+	case err := <-stopped:
+		t.Fatalf("the sidecar stopped while a file of its store was open: %v", err)
+	default:
+	}
+
+	// The file that is open is read, and closed, while the sidecar waits.
+	got := make([]byte, len(data))
+	if _, err := io.ReadFull(open, got); err != nil || !bytes.Equal(got, data) {
+		t.Errorf("reading the open file after the mount was detached: %v", err)
+	}
+	open.Close()
+	select {
+	case err := <-stopped:
+		if err != nil {
+			t.Errorf("stopping: %v", err)
+		}
+		t.Logf("the sidecar stopped %v after it was told to", time.Since(began))
+	case <-time.After(4 * time.Second):
+		t.Error("the sidecar did not stop when the last file was closed")
+		<-stopped
+	}
+}
+
+// mountsOn counts the NFS mounts on dir: one over the other they would be
+// more than one.
+func mountsOn(t *testing.T, dir string) int {
+	t.Helper()
+	table, err := os.ReadFile("/proc/self/mounts")
+	if err != nil {
+		t.Fatal(err)
+	}
+	n := 0
+	for _, line := range strings.Split(string(table), "\n") {
+		if fields := strings.Fields(line); len(fields) > 2 && fields[1] == dir && strings.HasPrefix(fields[2], "nfs") {
+			n++
+		}
+	}
+	return n
+}
+
+// A sidecar that was killed leaves its mount. The one that is started
+// after it serves that mount again if the kernel finds it, which it does
+// in the same pod at the same address. If the kernel does not, because
+// the mount is of another network namespace or another port, the mount is
+// dead for good: it is taken away and the server mounted anew, where a
+// sidecar that only saw "an NFS mount is there" would serve nobody.
+func TestALeftoverMountThatDoesNotReachTheSidecar(t *testing.T) {
+	if os.Getuid() != 0 {
+		t.Skip("mounting needs root: scripts/test-linux.sh runs this in a privileged container")
+	}
+	srv := jstest.Start(t)
+	dir := filepath.Join(t.TempDir(), "path")
+	write(t, filepath.Join(dir, "data"), []byte("content\n"), 0o644)
+	srv.PushDir(dir, prefix+"path")
+
+	mnt, cache := t.TempDir(), t.TempDir()
+	t.Cleanup(func() { mount.Detach(mnt) })
+	cfg := sidecar.Config{
+		Prefix: prefix,
+		Cache:  cache,
+		Dial: func(ctx context.Context) (refs.Conn, error) {
+			return refs.Connect(ctx, srv.DialConfig())
+		},
+		Listen:       "127.0.0.1:0",
+		Mount:        mnt,
+		MountOptions: "vers=4.1,soft,timeo=50,retrans=1,lookupcache=positive",
+		AdoptTimeout: 2 * time.Second,
+		Log:          slog.New(slog.NewTextHandler(logTo{t}, nil)),
+	}
+	first, err := sidecar.Start(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, err := os.ReadFile(filepath.Join(mnt, "path", "data")); err != nil || string(got) != "content\n" {
+		t.Fatalf("through the first sidecar: %q, %v", got, err)
+	}
+	// It goes without unmounting, and the next one listens elsewhere: the
+	// mount that is left asks for a server at a port nobody answers on.
+	was := first.Addr()
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
+	}
+	began := time.Now()
+	second, err := sidecar.Start(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Stop()
+	if second.Addr() == was {
+		t.Skip("the second sidecar was given the port of the first: the mount that was left is not dead")
+	}
+	t.Logf("the second sidecar was started in %v", time.Since(began))
+
+	if n := mountsOn(t, mnt); n != 1 {
+		t.Fatalf("%d NFS mounts on the directory, want the one of the second sidecar", n)
+	}
+	read := make(chan error, 1)
+	go func() {
+		got, err := os.ReadFile(filepath.Join(mnt, "path", "data"))
+		if err == nil && string(got) != "content\n" {
+			err = fmt.Errorf("read %q", got)
+		}
+		read <- err
+	}()
+	select {
+	case err := <-read:
+		if err != nil {
+			t.Fatalf("through the second sidecar: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the store does not answer: the mount that was left is still the one that is seen")
+	}
+
+	began = time.Now()
+	if err := second.Stop(); err != nil {
+		t.Errorf("stopping: %v", err)
+	}
+	if took := time.Since(began); took > 4*time.Second {
+		t.Errorf("stopping took %v", took)
+	}
+	if n := mountsOn(t, mnt); n != 0 {
+		t.Errorf("%d NFS mounts on the directory after the stop", n)
+	}
+}
