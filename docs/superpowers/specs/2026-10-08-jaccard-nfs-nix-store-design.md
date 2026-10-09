@@ -140,6 +140,10 @@ container.
 - The parts are put together in a package of their own, `sidecar`, which
   the command starts and the end-to-end tests start too: what is tested
   with the kernel is what runs.
+- The first deployment found that a sidecar must not stop serving the
+  moment it has unmounted (section 8): an app that ignored SIGTERM was
+  killed as the sidecar was stopped, and hung in its own exit for the
+  length of the mount's timeouts, waiting for a server that had gone.
 - A process cannot run a program from a mount it serves itself: the
   thread that starts a program stands still until the program is loaded.
   The sidecar never does; the tests go through a shell.
@@ -344,10 +348,19 @@ the background, while it is already served from the objects.
 - Without `--mount` the process only serves.
 - On SIGTERM or SIGINT the process unmounts DIR **while it still serves**:
   a plain unmount, tried for 2 s while it is refused as busy, then a
-  detaching one, after which the server goes on for 5 s so that the kernel
-  can end its session. Then the table is flushed and the process ends. A
-  second signal ends it at once. Materializing stops with the first
-  signal; what it had begun is removed at the next start.
+  detaching one. The server then goes on **until the kernel has let go of
+  it**: until no client has been connected for 250 ms, and for 5 s at the
+  most. Then the table is flushed and the process ends. A second signal
+  ends it at once. Materializing stops with the first signal; what it had
+  begun is removed at the next start.
+- The wait after the unmount is for the pod whose grace period has run
+  out. The kubelet then kills the app and stops the sidecar in the same
+  moment. The app is dying: its mount namespace is gone, so the unmount
+  is not refused, and the kernel is still closing the files the app had
+  open, each of which takes an answer from the server, and at last ends
+  its session. It closes its connection when it is done, and makes one at
+  once if it has none and needs the server, which is what the 250 ms are
+  for.
 - `timeo` and `retrans` bound two things: how long a request may take
   before the app sees `EIO` (a fetch of more than three minutes, at the
   default), and how long a pod's end is held up when the sidecar is killed
@@ -503,6 +516,9 @@ Tests are written before the code they cover.
   path with an escaped space, a path a mount point only begins with.
 - `sidecar`: the order of the unmount against a kernel that is busy for a
   moment, stays busy, has nothing mounted, or fails.
+- `nfsd`, the server: an accept that fails is tried again; the wait for
+  the server to be idle, with a client connected, after it went, and with
+  clients that keep coming.
 - The command: every flag against its variable, the flag over the
   variable, the defaults, and what is refused.
 - `e2e`, with the kernel, as root: a sidecar started on the server of the
@@ -514,8 +530,10 @@ Tests are written before the code they cover.
   that is one file, opened without a lookup; writes refused; a name that
   is missing and, once it is pushed, is not; the read size the kernel
   settled on; the sidecar closed and started again under the mount with a
-  file open; the unmount of section 8. They are skipped without root and
-  run in CI under `sudo` and locally in a privileged container.
+  file open; the unmount of section 8; and a process in a mount namespace
+  of its own that is killed, with a file of the store open, as the
+  sidecar is stopped, which has to end at once. They are skipped without
+  root and run in CI under `sudo` and locally in a privileged container.
 - By hand before the deployment: the image in a privileged container
   against the real server, a program run out of a fetched store path.
 
@@ -548,7 +566,10 @@ not have.
   `ENOENT`; a name that is missing is `ENOENT` for the next 5 s even if it
   is pushed meanwhile.
 - A sidecar killed while mounted, as the pod ends, holds the end of the
-  pod up for up to six minutes.
+  pod up for up to six minutes, and so does one that is stopped while an
+  app still runs and has files of the store open: the kubelet stops a
+  sidecar after the app containers, but gives it two seconds when the
+  pod's grace period has run out.
 - After a restart of the sidecar a file that was open stays readable, but
   byte-range locks are gone. Nothing in a read-only store takes them.
 - Permissions are `0444` and `0555` whatever was recorded; setuid, setgid

@@ -17,10 +17,11 @@ const (
 	// again, every busyEvery.
 	busyFor   = 2 * time.Second
 	busyEvery = 100 * time.Millisecond
-	// lingerFor is how long the server goes on after a mount that stayed
-	// busy was detached: the kernel ends its session with the server when
-	// the last user of the file system is gone, and waits for an answer.
+	// lingerFor is how long, at the most, the server goes on after the
+	// mount was taken away, for the kernel to be done with it; settleFor
+	// is how long no client must have been connected for it to be.
 	lingerFor = 5 * time.Second
+	settleFor = 250 * time.Millisecond
 )
 
 // leaver takes the mount away when the sidecar ends, while the server
@@ -35,7 +36,11 @@ type leaver struct {
 
 // leave unmounts target. An unmount that is refused because something
 // there is in use is tried again for busyFor; after that the mount is
-// detached and the server given lingerFor more.
+// detached.
+//
+// Either way the mount is then gone from the tree and the file system
+// behind it may not be: whoever stops the server has to wait for the
+// kernel to let go of it first (nfsd.Server.WaitIdle).
 func (l leaver) leave(target string) error {
 	for waited := time.Duration(0); ; waited += busyEvery {
 		err := l.unmount(target)
@@ -49,11 +54,7 @@ func (l leaver) leave(target string) error {
 			return err
 		case waited >= busyFor:
 			l.log.Warn("the mount is still in use: detaching it", "mount", target)
-			if err := l.detach(target); err != nil {
-				return err
-			}
-			l.sleep(lingerFor)
-			return nil
+			return l.detach(target)
 		}
 		l.sleep(busyEvery)
 	}

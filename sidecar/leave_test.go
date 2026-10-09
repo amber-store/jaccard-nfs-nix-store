@@ -74,10 +74,9 @@ func TestLeavingAMountThatStaysBusy(t *testing.T) {
 	if !k.detached {
 		t.Fatal("a mount that stayed busy was not detached")
 	}
-	// It was tried for busyFor, and then the server went on for lingerFor,
-	// so that the kernel could end its session with it.
-	if want := busyFor + lingerFor; k.slept != want {
-		t.Fatalf("%v slept, want %v", k.slept, want)
+	// It was tried for busyFor and no longer.
+	if k.slept != busyFor {
+		t.Fatalf("%v slept, want %v", k.slept, busyFor)
 	}
 }
 

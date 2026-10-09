@@ -170,8 +170,15 @@ func (s *Sidecar) Addr() netip.AddrPort {
 }
 
 // Stop ends the sidecar in order: the materializing stops, the mount is
-// taken away while the server still answers, and then everything is
-// closed.
+// taken away while the server still answers, the server goes on until the
+// kernel has let go of it, and then everything is closed.
+//
+// The third step is for the pod whose grace period has run out. The
+// kubelet then kills the app and stops the sidecar in the same moment,
+// and the kernel is still closing what the app had open when the unmount
+// has long succeeded: each of those files takes an answer from the
+// server, and a server that is gone leaves the dying app, and the pod,
+// to wait for the mount's timeouts.
 func (s *Sidecar) Stop() error {
 	s.files.Close()
 	var err error
@@ -179,6 +186,10 @@ func (s *Sidecar) Stop() error {
 		err = leaver{unmount: mount.Unmount, detach: mount.Detach, sleep: time.Sleep, log: s.log}.leave(s.cfg.Mount)
 		if err == nil {
 			s.log.Info("unmounted", "mount", s.cfg.Mount)
+			if !s.server.WaitIdle(lingerFor, settleFor) {
+				s.log.Warn("the kernel still holds a connection to the server, which stops now: "+
+					"whoever has files of the store open waits for the mount's timeouts", "after", lingerFor)
+			}
 		}
 	}
 	return errors.Join(err, s.Close())

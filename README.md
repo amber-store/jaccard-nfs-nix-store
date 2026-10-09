@@ -164,6 +164,14 @@ authentication, which is why it listens on loopback.
 - **Only directories, regular files and symbolic links are served**, which
   is what a NAR has. The target of a link reads in the NFS server's form
   of a path: `./a//b` as `a/b`.
+- **An app that does not end on SIGTERM** makes its pod wait for the whole
+  grace period, as anywhere, and a program that runs as the first process
+  of its container and installs no handler does not end on it. When the
+  period is over the kubelet kills the app and stops the sidecar together;
+  the sidecar then unmounts and serves on until the kernel has closed what
+  the app had open, which takes a moment. `shareProcessNamespace: true`
+  in the pod, or an init process in the container, makes such a program
+  end when it is asked to.
 - **A sidecar killed with its mount in place**, as the pod ends, holds the
   end of the pod up for as long as two request timeouts: six minutes with
   the default options.

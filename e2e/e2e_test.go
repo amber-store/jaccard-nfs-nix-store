@@ -459,3 +459,85 @@ func TestTheStoreMounted(t *testing.T) {
 		}
 	})
 }
+
+// When the grace period of a pod is over, the kubelet kills the app and
+// tells the sidecar to stop in the same moment. The app is dying then: its
+// mount namespace is gone, so the sidecar's unmount is not refused as
+// busy, and the kernel is still closing the files the app had open, which
+// takes an answer from the server for each. A sidecar that stopped serving
+// the moment it had unmounted left the app waiting for those answers until
+// the mount's timeouts ran out, and the pod with it.
+func TestAProcessKilledAsTheSidecarStops(t *testing.T) {
+	if os.Getuid() != 0 {
+		t.Skip("mounting needs root: scripts/test-linux.sh runs this in a privileged container")
+	}
+	if _, err := exec.LookPath("unshare"); err != nil {
+		t.Skip("no unshare to give a process a mount namespace of its own")
+	}
+	srv := jstest.Start(t)
+	dir := filepath.Join(t.TempDir(), "path")
+	write(t, filepath.Join(dir, "data"), randomBytes(1<<20, 3), 0o644)
+	srv.PushDir(dir, prefix+"path")
+
+	mnt, cache := t.TempDir(), t.TempDir()
+	t.Cleanup(func() { mount.Detach(mnt) })
+	sc, err := sidecar.Start(sidecar.Config{
+		Prefix: prefix,
+		Cache:  cache,
+		Dial: func(ctx context.Context) (refs.Conn, error) {
+			return refs.Connect(ctx, srv.DialConfig())
+		},
+		Listen: "127.0.0.1:0",
+		Mount:  mnt,
+		// Requests that time out in seconds, not minutes: a process
+		// that waits for a server that is gone ends within the test.
+		MountOptions: "vers=4.1,soft,timeo=50,retrans=1,lookupcache=positive",
+		Log:          slog.New(slog.NewTextHandler(logTo{t}, nil)),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// A process in a mount namespace of its own, as a container's is,
+	// with a file of the store open.
+	app := exec.Command("unshare", "-m", "--propagation", "private",
+		"sh", "-c", `exec 3< "$0" && echo ready && exec sleep 1000`, filepath.Join(mnt, "path", "data"))
+	out, err := app.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	app.Stderr = logTo{t}
+	if err := app.Start(); err != nil {
+		t.Fatal(err)
+	}
+	ready := make([]byte, len("ready\n"))
+	if _, err := io.ReadFull(out, ready); err != nil || string(ready) != "ready\n" {
+		app.Process.Kill()
+		t.Fatalf("the process did not get the file open: %q, %v", ready, err)
+	}
+
+	if err := app.Process.Kill(); err != nil {
+		t.Fatal(err)
+	}
+	began := time.Now()
+	if err := sc.Stop(); err != nil {
+		t.Errorf("stopping: %v", err)
+	}
+	t.Logf("the sidecar stopped after %v", time.Since(began))
+	ended := make(chan struct{})
+	go func() {
+		app.Wait()
+		close(ended)
+	}()
+	select {
+	case <-ended:
+		t.Logf("the process ended %v after it was killed", time.Since(began))
+	case <-time.After(4 * time.Second):
+		t.Error("the process that was killed has not ended: it is waiting for a server that has gone")
+		<-ended
+		t.Logf("it ended %v after it was killed", time.Since(began))
+	}
+	if _, mounted, err := mount.Mounted(mnt); err != nil || mounted {
+		t.Errorf("after the stop: mounted %v, %v", mounted, err)
+	}
+}

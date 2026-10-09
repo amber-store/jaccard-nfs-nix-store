@@ -112,6 +112,79 @@ func TestAnAcceptThatFailsIsTriedAgain(t *testing.T) {
 	srv.Close()
 }
 
+func TestWaitIdle(t *testing.T) {
+	w := newWorld(t)
+	srv := NewServer(w.fs)
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	go srv.Serve(l)
+	defer srv.Close()
+	const settle = 30 * time.Millisecond
+
+	// Nobody is connected, and nobody was for the time it takes.
+	began := time.Now()
+	if !srv.WaitIdle(10*time.Second, settle) {
+		t.Fatal("a server nobody is connected to is not idle")
+	}
+	if took := time.Since(began); took < settle || took > 5*time.Second {
+		t.Fatalf("it took %v to find the server idle, want about %v", took, settle)
+	}
+
+	// While a client is connected the server is not idle, however long.
+	c, err := net.Dial("tcp", l.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	began = time.Now()
+	if srv.WaitIdle(150*time.Millisecond, settle) {
+		t.Fatal("a server with a client connected is idle")
+	}
+	if took := time.Since(began); took < 150*time.Millisecond {
+		t.Fatalf("it gave up after %v, before its limit", took)
+	}
+
+	// The client goes, and the server is idle soon after.
+	idle := make(chan bool, 1)
+	go func() { idle <- srv.WaitIdle(10*time.Second, settle) }()
+	time.Sleep(50 * time.Millisecond)
+	c.Close()
+	select {
+	case ok := <-idle:
+		if !ok {
+			t.Fatal("the server is not idle after its client went")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the server did not notice that its client went")
+	}
+
+	// A client that comes and goes while the server waits to be idle
+	// starts the wait over: it is not idle before nobody came for settle.
+	stop := make(chan struct{})
+	knocked := make(chan struct{})
+	go func() {
+		defer close(knocked)
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			if c, err := net.Dial("tcp", l.Addr().String()); err == nil {
+				c.Close()
+			}
+			time.Sleep(settle / 6)
+		}
+	}()
+	if srv.WaitIdle(8*settle, settle) {
+		t.Error("a server that clients keep coming to is idle")
+	}
+	close(stop)
+	<-knocked
+}
+
 func isReset(err error) bool {
 	_, ok := err.(*net.OpError)
 	return ok

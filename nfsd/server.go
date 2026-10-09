@@ -38,10 +38,13 @@ type Server struct {
 	rpc *rpcserver.Server
 	log *slog.Logger
 
-	mu     sync.Mutex
-	conns  map[net.Conn]struct{}
-	closed bool
-	served sync.WaitGroup
+	mu    sync.Mutex
+	conns map[net.Conn]struct{}
+	// accepted counts the connections there ever were, so that one that
+	// came and went between two looks is not missed.
+	accepted uint64
+	closed   bool
+	served   sync.WaitGroup
 }
 
 // NewServer returns a server of fs, set up as Buildbarn sets its own up:
@@ -159,6 +162,7 @@ func (s *Server) add(c net.Conn) bool {
 		return false
 	}
 	s.conns[c] = struct{}{}
+	s.accepted++
 	s.served.Add(1)
 	return true
 }
@@ -169,6 +173,46 @@ func (s *Server) remove(c net.Conn) {
 	delete(s.conns, c)
 	s.mu.Unlock()
 	s.served.Done()
+}
+
+// idlePoll is how often WaitIdle looks.
+const idlePoll = 10 * time.Millisecond
+
+// WaitIdle waits until no client has been connected for settle, and
+// reports whether that came about within limit.
+//
+// It is how a sidecar that has unmounted knows that the kernel is done
+// with the server. Unmounting takes the mount out of the tree; the file
+// system behind it lives on while anything holds it, a process that is
+// dying with files of it open for one, and the kernel asks the server for
+// every file it closes and at last to end the session. Then it closes its
+// connection. A kernel that still needs the server and has no connection
+// makes one at once, which is what settle is for.
+func (s *Server) WaitIdle(limit, settle time.Duration) bool {
+	deadline := time.Now().Add(limit)
+	var since time.Time // when the server was first seen without a client
+	var seen uint64
+	for {
+		s.mu.Lock()
+		connected, accepted := len(s.conns), s.accepted
+		s.mu.Unlock()
+		now := time.Now()
+		if connected > 0 || accepted != seen {
+			since, seen = time.Time{}, accepted
+		}
+		if connected == 0 {
+			if since.IsZero() {
+				since = now
+			}
+			if now.Sub(since) >= settle {
+				return true
+			}
+		}
+		if !now.Before(deadline) {
+			return false
+		}
+		time.Sleep(idlePoll)
+	}
 }
 
 // Close closes every connection and waits for their serving to end. The
