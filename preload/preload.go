@@ -155,24 +155,29 @@ func Fetch(ctx context.Context, fetch Fetcher, jobs int, names []string) error {
 	if jobs < 1 {
 		jobs = DefaultJobs
 	}
-	group, ctx := errgroup.WithContext(ctx)
+	group, fetching := errgroup.WithContext(ctx)
 	group.SetLimit(jobs)
 	for _, name := range names {
 		// Go waits for a job to be free. One may have failed meanwhile.
-		if ctx.Err() != nil {
+		if fetching.Err() != nil {
 			break
 		}
 		group.Go(func() error {
-			if err := ctx.Err(); err != nil {
+			if err := fetching.Err(); err != nil {
 				return err
 			}
-			if _, err := fetch.Preload(ctx, name); err != nil {
+			if _, err := fetch.Preload(fetching, name); err != nil {
 				return &Failure{Name: name, Err: err}
 			}
 			return nil
 		})
 	}
-	return group.Wait()
+	if err := group.Wait(); err != nil {
+		return err
+	}
+	// No fetch failed. If ctx ended meanwhile, not every name was begun:
+	// that nothing went wrong does not make it true that all are there.
+	return ctx.Err()
 }
 
 // parse returns the names of the store paths a list holds, each once, in
