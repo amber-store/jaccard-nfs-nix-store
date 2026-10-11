@@ -18,6 +18,9 @@
 // Fetched means what it means for a lookup: the reference is pulled and
 // pinned, and is served from then on. It is not waited for to be
 // materialized.
+//
+// Fetch is the same without the endpoint, for a program that has the
+// sidecar in it and the names at hand.
 package preload
 
 import (
@@ -103,8 +106,8 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	began := time.Now()
-	err = h.fetchAll(r.Context(), names)
-	var failed *failure
+	err = Fetch(r.Context(), h.fetch, h.jobs, names)
+	var failed *Failure
 	switch {
 	case err == nil:
 		h.log.Info("preloaded", "paths", len(names), "took", time.Since(began))
@@ -113,33 +116,47 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// Whoever asked is gone, or the sidecar is stopping: there is
 		// nobody to answer.
 		h.log.Info("preload given up", "paths", len(names), "took", time.Since(began))
-	case errors.As(err, &failed) && errors.Is(failed.err, refs.ErrNotFound):
-		h.log.Warn("preload failed", "path", failed.path(), "error", failed.err)
-		http.Error(w, failed.path()+": the server has no such path", http.StatusNotFound)
+	case errors.As(err, &failed) && errors.Is(failed.Err, refs.ErrNotFound):
+		h.log.Warn("preload failed", "path", failed.Path(), "error", failed.Err)
+		http.Error(w, failed.Path()+": the server has no such path", http.StatusNotFound)
 	case errors.As(err, &failed):
-		h.log.Warn("preload failed", "path", failed.path(), "error", failed.err)
-		http.Error(w, failed.path()+": could not be fetched: "+failed.err.Error(), http.StatusBadGateway)
+		h.log.Warn("preload failed", "path", failed.Path(), "error", failed.Err)
+		http.Error(w, failed.Path()+": could not be fetched: "+failed.Err.Error(), http.StatusBadGateway)
 	default:
 		http.Error(w, err.Error(), http.StatusBadGateway)
 	}
 }
 
-// failure is the path of a list that could not be fetched, and why.
-type failure struct {
-	name string
-	err  error
+// Failure is the store path of a list that could not be fetched, and why.
+type Failure struct {
+	// Name is the name of the store path, without /nix/store/.
+	Name string
+	// Err is why: refs.ErrNotFound for a path the server does not have.
+	Err error
 }
 
-func (f *failure) path() string  { return storeDir + "/" + f.name }
-func (f *failure) Error() string { return f.path() + ": " + f.err.Error() }
-func (f *failure) Unwrap() error { return f.err }
+// Path returns the store path: /nix/store/<name>.
+func (f *Failure) Path() string { return storeDir + "/" + f.Name }
 
-// fetchAll fetches the store paths of the names, as many at once as there
-// are jobs. The first that fails ends the context the others run under,
-// and no further one is begun; its failure is what is returned.
-func (h *handler) fetchAll(ctx context.Context, names []string) error {
+// Error returns the store path and why it could not be fetched.
+func (f *Failure) Error() string { return f.Path() + ": " + f.Err.Error() }
+
+// Unwrap returns why the store path could not be fetched.
+func (f *Failure) Unwrap() error { return f.Err }
+
+// Fetch fetches the store paths of the names with fetch, as many at once
+// as there are jobs; fewer than one job means DefaultJobs. A name is the
+// name of a store path, without /nix/store/.
+//
+// The first name that cannot be fetched ends the context the others run
+// under, and no further one is begun; it is what Fetch returns, as a
+// *Failure. When ctx ends Fetch returns an error that is ctx's.
+func Fetch(ctx context.Context, fetch Fetcher, jobs int, names []string) error {
+	if jobs < 1 {
+		jobs = DefaultJobs
+	}
 	group, ctx := errgroup.WithContext(ctx)
-	group.SetLimit(h.jobs)
+	group.SetLimit(jobs)
 	for _, name := range names {
 		// Go waits for a job to be free. One may have failed meanwhile.
 		if ctx.Err() != nil {
@@ -149,8 +166,8 @@ func (h *handler) fetchAll(ctx context.Context, names []string) error {
 			if err := ctx.Err(); err != nil {
 				return err
 			}
-			if _, err := h.fetch.Preload(ctx, name); err != nil {
-				return &failure{name: name, err: err}
+			if _, err := fetch.Preload(ctx, name); err != nil {
+				return &Failure{Name: name, Err: err}
 			}
 			return nil
 		})
