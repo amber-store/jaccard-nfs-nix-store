@@ -149,6 +149,13 @@ initContainers:
 There is no authentication, which is why the endpoint listens on loopback.
 `--preload-listen ''` turns it off.
 
+A program that has the sidecar in it, with package `sidecar`, needs no
+endpoint: `Sidecar.Preload` takes the names of the store paths and fetches
+them the same way, `PreloadJobs` at a time. The first that cannot be
+fetched ends the rest and is the error, which names the path and is
+`refs.ErrNotFound` for one the server does not have. The call ends with
+its context, and with the sidecar.
+
 ## Command
 
 ```sh
@@ -254,7 +261,7 @@ scripts/test-linux.sh -run Mounted -v ./e2e/
 | package | what it is |
 | --- | --- |
 | `refs` | fetching: a reference pulled once and pinned |
-| `preload` | the HTTP endpoint that fetches a list of store paths ahead |
+| `preload` | the fetching of a list of store paths ahead, and the HTTP endpoint for it |
 | `materialize` | a pinned reference written out as plain files |
 | `tree` | directories and file content read from the objects |
 | `handles` | the file handle of a path, and the table back from it |
