@@ -56,7 +56,8 @@ type Config struct {
 	// lists of store paths to fetch ahead (package preload). Empty means
 	// there is none.
 	PreloadListen string
-	// PreloadJobs is how many paths of one list are fetched at once.
+	// PreloadJobs is how many paths of one list, or of one call of
+	// Preload, are fetched at once.
 	PreloadJobs int
 
 	// AdoptTimeout is how long a mount that an earlier run of the
@@ -67,6 +68,10 @@ type Config struct {
 	// Log receives what the sidecar does. Nil means slog.Default().
 	Log *slog.Logger
 }
+
+// ErrStopped is what Preload returns for a sidecar that was stopped,
+// before the call or while it ran.
+var ErrStopped = errors.New("sidecar: stopped")
 
 // Sidecar is a sidecar that runs.
 type Sidecar struct {
@@ -80,11 +85,14 @@ type Sidecar struct {
 	listener net.Listener
 	served   chan struct{}
 
-	// The preload endpoint, when there is one. endPreloads ends the
-	// requests that are being answered.
+	// preloading is the context every preload runs under, the requests
+	// of the endpoint and the calls of Preload. endPreloads ends them.
+	preloading  context.Context
+	endPreloads context.CancelFunc
+
+	// The preload endpoint, when there is one.
 	preloads        *http.Server
 	preloadListener net.Listener
-	endPreloads     context.CancelFunc
 }
 
 // Start opens the cache, serves it on cfg.Listen and, when cfg.Mount
@@ -95,6 +103,7 @@ func Start(cfg Config) (_ *Sidecar, err error) {
 	if s.log == nil {
 		s.log = slog.Default()
 	}
+	s.preloading, s.endPreloads = context.WithCancel(context.Background())
 	// What was opened is closed again when a later step fails.
 	defer func() {
 		if err != nil {
@@ -179,12 +188,11 @@ func (s *Sidecar) servePreloads() error {
 	if err != nil {
 		return fmt.Errorf("the preload endpoint: %w", err)
 	}
-	ctx, cancel := context.WithCancel(context.Background())
-	s.preloadListener, s.endPreloads = l, cancel
+	s.preloadListener = l
 	s.preloads = &http.Server{
 		Handler:           preload.New(s.store, s.cfg.PreloadJobs, s.log),
 		ReadHeaderTimeout: 10 * time.Second,
-		BaseContext:       func(net.Listener) context.Context { return ctx },
+		BaseContext:       func(net.Listener) context.Context { return s.preloading },
 	}
 	go func() {
 		if err := s.preloads.Serve(l); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -195,13 +203,48 @@ func (s *Sidecar) servePreloads() error {
 	return nil
 }
 
-// stopPreloads closes the preload endpoint and ends its requests.
+// stopPreloads ends the preloads that are under way, and closes the
+// preload endpoint if there is one.
 func (s *Sidecar) stopPreloads() {
-	if s.preloads == nil {
-		return
-	}
 	s.endPreloads()
-	s.preloads.Close()
+	if s.preloads != nil {
+		s.preloads.Close()
+	}
+}
+
+// Preload fetches the store paths of names, each the name of a store path
+// without /nix/store/, as the preload endpoint fetches a list:
+// Config.PreloadJobs at once; the first that cannot be fetched ends the
+// others and is returned. The error names the path, and errors.Is finds
+// refs.ErrNotFound in it when the server has no such reference.
+//
+// Preload ends with ctx, whose error it then returns, and when the
+// sidecar is stopped, with ErrStopped. It needs no preload endpoint: it is
+// for a program that has the sidecar in it.
+func (s *Sidecar) Preload(ctx context.Context, names []string) error {
+	if s.preloading.Err() != nil {
+		return ErrStopped
+	}
+	fetching, cancel := context.WithCancel(ctx)
+	defer cancel()
+	defer context.AfterFunc(s.preloading, cancel)()
+
+	began := time.Now()
+	err := preload.Fetch(fetching, s.store, s.cfg.PreloadJobs, names)
+	var failed *preload.Failure
+	switch {
+	case err == nil:
+		s.log.Info("preloaded", "paths", len(names), "took", time.Since(began))
+		return nil
+	case s.preloading.Err() != nil:
+		return ErrStopped
+	case ctx.Err() != nil:
+		s.log.Info("preload given up", "paths", len(names), "took", time.Since(began))
+		return ctx.Err()
+	case errors.As(err, &failed):
+		s.log.Warn("preload failed", "path", failed.Path(), "error", failed.Err)
+	}
+	return err
 }
 
 // PreloadAddr returns the address the preload endpoint listens on. There
