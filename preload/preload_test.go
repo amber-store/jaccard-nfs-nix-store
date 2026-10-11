@@ -397,3 +397,18 @@ func TestFetchEndsWithItsContext(t *testing.T) {
 		t.Errorf("%d fetches told to stop of %d begun, want 2 of 2", len(f.ended), len(f.asked))
 	}
 }
+
+// A context that has ended before the last name was begun is the error,
+// also when no fetch was there to report it: nothing was fetched, and
+// Fetch does not say that everything was.
+func TestFetchWithAContextThatHasEnded(t *testing.T) {
+	f := &fetcher{}
+	ctx, giveUp := context.WithCancel(context.Background())
+	giveUp()
+	if err := Fetch(ctx, f, 2, []string{"p0", "p1", "p2"}); !errors.Is(err, context.Canceled) {
+		t.Errorf("Fetch = %v, want the context's error", err)
+	}
+	if _, asked := f.now(); asked != 0 {
+		t.Errorf("%d fetches under a context that had ended", asked)
+	}
+}
