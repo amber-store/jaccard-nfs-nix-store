@@ -300,3 +300,100 @@ func TestAListThatIsTooLong(t *testing.T) {
 		t.Fatalf("%d fetches of a list that was refused", asked)
 	}
 }
+
+// Fetch is the fetching without the endpoint: what a program that has the
+// sidecar in it calls with the names it has.
+func TestFetchFetchesEveryName(t *testing.T) {
+	f := &fetcher{}
+	names := []string{"aaa-hello-2.12", "bbb-glibc-2.42", "ccc-bash-5.3"}
+	if err := Fetch(context.Background(), f, 2, names); err != nil {
+		t.Fatalf("Fetch: %v", err)
+	}
+	if got := f.names(); !slices.Equal(got, names) {
+		t.Errorf("fetched %q, want %q", got, names)
+	}
+	nothing := &fetcher{}
+	if err := Fetch(context.Background(), nothing, 2, nil); err != nil {
+		t.Errorf("Fetch of no name: %v", err)
+	}
+	if _, asked := nothing.now(); asked != 0 {
+		t.Errorf("%d fetches for no name", asked)
+	}
+}
+
+func TestFetchNamesThePathThatFailed(t *testing.T) {
+	broken := errors.New("the bucket answered 503")
+	for _, c := range []struct {
+		name     string
+		err      error
+		notFound bool
+	}{
+		{"bbb-missing", fmt.Errorf("%w: %q", refs.ErrNotFound, "bbb-missing"), true},
+		{"bbb-broken", broken, false},
+	} {
+		f := &fetcher{fail: map[string]error{c.name: c.err}}
+		// One job: the names are fetched in their order.
+		err := Fetch(context.Background(), f, 1, []string{"aaa-there", c.name, "ccc-never"})
+		var failed *Failure
+		if !errors.As(err, &failed) {
+			t.Fatalf("%s: Fetch = %v, want a *Failure", c.name, err)
+		}
+		if failed.Name != c.name || failed.Path() != "/nix/store/"+c.name {
+			t.Errorf("%s: the failure is of %q, %q", c.name, failed.Name, failed.Path())
+		}
+		if !errors.Is(err, c.err) || errors.Is(err, refs.ErrNotFound) != c.notFound {
+			t.Errorf("%s: Fetch = %v: it does not hold why", c.name, err)
+		}
+		if want := "/nix/store/" + c.name + ": " + c.err.Error(); err.Error() != want {
+			t.Errorf("%s: the error reads %q, want %q", c.name, err, want)
+		}
+		if got := f.names(); slices.Contains(got, "ccc-never") {
+			t.Errorf("%s: fetched %q, want none after the failure", c.name, got)
+		}
+	}
+}
+
+// Fewer than one job means DefaultJobs, as with New.
+func TestFetchNoMoreAtOnceThanTheJobs(t *testing.T) {
+	f := &fetcher{hold: make(chan struct{})}
+	var names []string
+	for i := range 3 * DefaultJobs {
+		names = append(names, fmt.Sprintf("p%03d", i))
+	}
+	done := make(chan error, 1)
+	go func() { done <- Fetch(context.Background(), f, 0, names) }()
+	eventually(t, "as many fetches run as the default has jobs", func() bool { r, _ := f.now(); return r == DefaultJobs })
+	time.Sleep(50 * time.Millisecond)
+	if running, asked := f.now(); running != DefaultJobs || asked != DefaultJobs {
+		t.Fatalf("%d running and %d begun, want %d of each", running, asked, DefaultJobs)
+	}
+	close(f.hold)
+	if err := <-done; err != nil {
+		t.Fatalf("Fetch: %v", err)
+	}
+	if _, asked := f.now(); asked != len(names) {
+		t.Fatalf("%d fetched, want %d", asked, len(names))
+	}
+}
+
+func TestFetchEndsWithItsContext(t *testing.T) {
+	f := &fetcher{hold: make(chan struct{})}
+	ctx, giveUp := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- Fetch(ctx, f, 2, []string{"p0", "p1", "p2"}) }()
+	eventually(t, "two fetches run", func() bool { r, _ := f.now(); return r == 2 })
+	giveUp()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Errorf("Fetch = %v, want the context's error", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Fetch went on after its context ended")
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.ended) != 2 || len(f.asked) != 2 {
+		t.Errorf("%d fetches told to stop of %d begun, want 2 of 2", len(f.ended), len(f.asked))
+	}
+}
